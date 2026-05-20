@@ -500,3 +500,304 @@ function formatDuration(sec) {
 
 // Prevent accidental zoom on double-tap
 document.addEventListener('gesturestart', e => e.preventDefault());
+
+// ══════════════════════════════════════════════════════════════════════
+// MODE 4 — CHAT
+// Self-contained namespace; does NOT touch Talk/Record/Memos handlers.
+// ══════════════════════════════════════════════════════════════════════
+const chat = {
+  state: {
+    authenticated: false,
+    chats: [],
+    currentChatId: null,
+    sending: false,
+    activated: false,
+  },
+  el: {},
+
+  init() {
+    this.el = {
+      login:           $('#chatLogin'),
+      app:             $('#chatApp'),
+      loginForm:       $('#chatLoginForm'),
+      passwordInput:   $('#chatPasswordInput'),
+      loginError:      $('#chatLoginError'),
+      newButton:       $('#chatNewButton'),
+      list:            $('#chatList'),
+      title:           $('#chatTitle'),
+      messages:        $('#chatMessages'),
+      input:           $('#chatInput'),
+      sendButton:      $('#chatSendButton'),
+      hamburger:       $('#chatHamburger'),
+      sidebar:         $('#chatSidebar'),
+      sidebarBackdrop: $('#chatSidebarBackdrop'),
+      logoutButton:    $('#chatLogoutButton'),
+    };
+
+    this.el.loginForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      this.login();
+    });
+    this.el.newButton.addEventListener('click', () => this.createChat());
+    this.el.logoutButton.addEventListener('click', () => this.logout());
+    this.el.sendButton.addEventListener('click', () => this.sendMessage());
+    this.el.input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        this.sendMessage();
+      }
+    });
+    this.el.input.addEventListener('input', () => this.autoResize());
+    this.el.hamburger.addEventListener('click', () => this.toggleSidebar());
+    this.el.sidebarBackdrop.addEventListener('click', () => this.closeSidebar());
+
+    // iOS standalone keyboard handling: scroll the composer into view on focus
+    this.el.input.addEventListener('focus', () => {
+      setTimeout(() => {
+        this.el.input.scrollIntoView({ block: 'end', behavior: 'smooth' });
+      }, 300);
+    });
+  },
+
+  async onActivate() {
+    document.body.classList.add('chat-mode');
+    if (this.state.activated) return;  // initial fetch already done this session
+    try {
+      const r = await fetch('/chat/api/auth-status');
+      const data = await r.json();
+      this.state.authenticated = !!data.authenticated;
+    } catch {
+      this.state.authenticated = false;
+    }
+    this.state.activated = true;
+    if (this.state.authenticated) {
+      this.showApp();
+      await this.loadChats();
+    } else {
+      this.showLogin();
+    }
+  },
+
+  onDeactivate() {
+    document.body.classList.remove('chat-mode');
+  },
+
+  showLogin() {
+    this.el.login.classList.add('visible');
+    this.el.app.classList.remove('visible');
+    setTimeout(() => this.el.passwordInput.focus(), 100);
+  },
+
+  showApp() {
+    this.el.login.classList.remove('visible');
+    this.el.app.classList.add('visible');
+  },
+
+  async login() {
+    const password = this.el.passwordInput.value;
+    this.el.loginError.textContent = '';
+    try {
+      const r = await fetch('/chat/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      if (!r.ok) {
+        this.el.loginError.textContent = 'Wrong password — try again.';
+        this.el.passwordInput.select();
+        return;
+      }
+      this.state.authenticated = true;
+      this.el.passwordInput.value = '';
+      this.showApp();
+      await this.loadChats();
+    } catch {
+      this.el.loginError.textContent = 'Network error.';
+    }
+  },
+
+  async logout() {
+    try { await fetch('/chat/api/logout', { method: 'POST' }); } catch {}
+    this.state.authenticated = false;
+    this.state.currentChatId = null;
+    this.state.chats = [];
+    this.el.messages.innerHTML = '<div class="chat-empty">Pick a chat or start a new one.</div>';
+    this.el.title.textContent = 'No chat selected';
+    this.showLogin();
+  },
+
+  async loadChats() {
+    try {
+      const r = await fetch('/chat/api/chats');
+      if (r.status === 401) { this.state.authenticated = false; this.showLogin(); return; }
+      if (!r.ok) return;
+      this.state.chats = await r.json();
+      this.renderChatList();
+    } catch {}
+  },
+
+  renderChatList() {
+    if (!this.state.chats.length) {
+      this.el.list.innerHTML = '<div class="chat-list-empty">No chats yet.</div>';
+      return;
+    }
+    this.el.list.innerHTML = '';
+    this.state.chats.forEach(c => {
+      const div = document.createElement('div');
+      div.className = 'chat-list-item';
+      if (c.chat_id === this.state.currentChatId) div.classList.add('active');
+      const titleClass = c.title ? '' : 'empty';
+      const titleText = c.title || 'New chat';
+      const ts = c.last_message_at || c.created_at;
+      div.innerHTML = `
+        <div class="chat-list-item-title ${titleClass}">${escapeHtml(titleText)}</div>
+        <div class="chat-list-item-time">${this.relativeTime(ts)}</div>
+      `;
+      div.addEventListener('click', () => this.openChat(c.chat_id));
+      this.el.list.appendChild(div);
+    });
+  },
+
+  async createChat() {
+    try {
+      const r = await fetch('/chat/api/chats', { method: 'POST' });
+      if (!r.ok) return;
+      const data = await r.json();
+      const newChat = {
+        chat_id: data.chat_id,
+        title: null,
+        created_at: new Date().toISOString(),
+        last_message_at: null,
+      };
+      this.state.chats.unshift(newChat);
+      this.state.currentChatId = data.chat_id;
+      this.renderChatList();
+      this.el.messages.innerHTML = '<div class="chat-empty">Send your first message.</div>';
+      this.el.title.textContent = 'New chat';
+      this.closeSidebar();
+      setTimeout(() => this.el.input.focus(), 80);
+    } catch {}
+  },
+
+  async openChat(chatId) {
+    this.state.currentChatId = chatId;
+    this.renderChatList();
+    const item = this.state.chats.find(c => c.chat_id === chatId);
+    this.el.title.textContent = item?.title || 'New chat';
+    this.closeSidebar();
+    try {
+      const r = await fetch(`/chat/api/chats/${chatId}/messages`);
+      if (!r.ok) return;
+      const msgs = await r.json();
+      this.renderMessages(msgs);
+    } catch {}
+  },
+
+  renderMessages(msgs) {
+    if (!msgs.length) {
+      this.el.messages.innerHTML = '<div class="chat-empty">Send your first message.</div>';
+      return;
+    }
+    this.el.messages.innerHTML = '';
+    msgs.forEach(m => this.appendMessage(m));
+    this.scrollToBottom();
+  },
+
+  appendMessage(m) {
+    const empty = this.el.messages.querySelector('.chat-empty');
+    if (empty) empty.remove();
+    const div = document.createElement('div');
+    div.className = `chat-bubble chat-bubble-${m.role}`;
+    if (m.pending) div.classList.add('chat-bubble-pending');
+    div.textContent = m.content;
+    this.el.messages.appendChild(div);
+    this.scrollToBottom();
+    return div;
+  },
+
+  scrollToBottom() {
+    this.el.messages.scrollTop = this.el.messages.scrollHeight;
+  },
+
+  async sendMessage() {
+    if (this.state.sending) return;
+    const content = this.el.input.value.trim();
+    if (!content) return;
+    if (!this.state.currentChatId) {
+      await this.createChat();
+      if (!this.state.currentChatId) return;
+    }
+
+    const chatId = this.state.currentChatId;
+    this.state.sending = true;
+    this.el.sendButton.disabled = true;
+    this.el.input.value = '';
+    this.autoResize();
+
+    this.appendMessage({ role: 'user', content });
+    const pendingEl = this.appendMessage({
+      role: 'assistant',
+      content: 'thinking…',
+      pending: true,
+    });
+
+    try {
+      const r = await fetch(`/chat/api/chats/${chatId}/message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      });
+      if (!r.ok) throw new Error(`server ${r.status}`);
+      const reply = await r.json();
+      pendingEl.classList.remove('chat-bubble-pending');
+      pendingEl.textContent = reply.content;
+      this.scrollToBottom();
+      await this.loadChats();
+      // Refresh main-pane title now that the server may have auto-set it.
+      const updated = this.state.chats.find(c => c.chat_id === chatId);
+      if (updated?.title) this.el.title.textContent = updated.title;
+    } catch {
+      pendingEl.classList.remove('chat-bubble-pending');
+      pendingEl.textContent = '(error — please try again)';
+    } finally {
+      this.state.sending = false;
+      this.el.sendButton.disabled = false;
+    }
+  },
+
+  autoResize() {
+    const el = this.el.input;
+    el.style.height = 'auto';
+    el.style.height = Math.min(140, el.scrollHeight) + 'px';
+  },
+
+  toggleSidebar() { this.el.app.classList.toggle('sidebar-open'); },
+  closeSidebar()  { this.el.app.classList.remove('sidebar-open'); },
+
+  relativeTime(iso) {
+    if (!iso) return '';
+    const ts = iso.endsWith('Z') ? iso : iso + 'Z';
+    const t = new Date(ts);
+    const diff = (Date.now() - t.getTime()) / 1000;
+    if (diff < 60)         return 'just now';
+    if (diff < 3600)       return `${Math.floor(diff / 60)} min ago`;
+    if (diff < 86400)      return `${Math.floor(diff / 3600)}h ago`;
+    if (diff < 86400 * 2)  return 'yesterday';
+    if (diff < 86400 * 7)  return `${Math.floor(diff / 86400)}d ago`;
+    return t.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  },
+};
+
+chat.init();
+
+// Additive tab listener: toggles body.chat-mode and triggers chat lifecycle.
+// Runs alongside the existing tab→switchMode listener; does not replace it.
+$$('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    if (tab.dataset.mode === 'chat') {
+      chat.onActivate();
+    } else {
+      chat.onDeactivate();
+    }
+  });
+});

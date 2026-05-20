@@ -42,6 +42,10 @@
         <span class="tab-num">03</span>
         <span class="tab-label">Memos</span>
       </button>
+      <button class="tab" data-mode="chat">
+        <span class="tab-num">04</span>
+        <span class="tab-label">Chat</span>
+      </button>
     </nav>
 
     <main class="stage">
@@ -116,6 +120,68 @@
 
         <div class="memo-list" id="memoList">
           <div class="memo-empty">No memos yet. Record something.</div>
+        </div>
+      </section>
+
+      <!-- ───── MODE 4: CHAT ───── -->
+      <section class="screen screen-chat" data-screen="chat">
+        <!-- Logged-out view -->
+        <div class="chat-login" id="chatLogin">
+          <div class="chat-login-card">
+            <div class="chat-login-title">Sign in</div>
+            <div class="chat-login-sub">Chat with Jarvis. Single password gate.</div>
+            <form class="chat-login-form" id="chatLoginForm">
+              <input
+                type="password"
+                id="chatPasswordInput"
+                placeholder="password"
+                autocomplete="current-password"
+                inputmode="numeric"
+              />
+              <button type="submit" class="chat-login-button">Sign in</button>
+            </form>
+            <div class="chat-login-error" id="chatLoginError"></div>
+          </div>
+        </div>
+
+        <!-- Logged-in view -->
+        <div class="chat-app" id="chatApp">
+          <aside class="chat-sidebar" id="chatSidebar">
+            <div class="chat-sidebar-header">
+              <button class="chat-new-button" id="chatNewButton">+ New Chat</button>
+            </div>
+            <div class="chat-list" id="chatList"></div>
+            <div class="chat-sidebar-footer">
+              <button class="chat-logout-button" id="chatLogoutButton">log out</button>
+            </div>
+          </aside>
+
+          <div class="chat-main">
+            <div class="chat-main-header">
+              <button class="chat-hamburger" id="chatHamburger" aria-label="Toggle sidebar">
+                <span></span><span></span><span></span>
+              </button>
+              <div class="chat-title" id="chatTitle">No chat selected</div>
+            </div>
+
+            <div class="chat-messages" id="chatMessages">
+              <div class="chat-empty">Pick a chat or start a new one.</div>
+            </div>
+
+            <div class="chat-composer">
+              <textarea
+                id="chatInput"
+                placeholder="Message Jarvis…"
+                rows="1"
+                autocomplete="off"
+                autocorrect="off"
+                spellcheck="false"
+              ></textarea>
+              <button class="chat-send-button" id="chatSendButton">send</button>
+            </div>
+          </div>
+
+          <div class="chat-sidebar-backdrop" id="chatSidebarBackdrop"></div>
         </div>
       </section>
     </main>

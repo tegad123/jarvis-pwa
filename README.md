@@ -216,3 +216,11 @@ jarvis-pwa/
 - **Always-on recording** — see "deliberate divergence" above. Easy to add if needed.
 - **Multi-user** — currently single-user (Spencer). Adding Eddie/Blake/Martin requires auth, which is a known follow-up.
 - **Skill execution from talk mode** — Mode 1 acknowledges tasks but doesn't execute. The path for execution is: talk → Spencer says "log a task to…" → talk-mode replies "on it" → posts to Discord → main Jarvis processes. Currently the talk mode does the acknowledgment but doesn't post to Discord yet. Easy to wire in once the rest is tested.
+
+### Chat mode (Mode 4)
+
+- **No login rate limiting.** The `/chat/api/login` endpoint accepts unlimited attempts. This is acceptable for a single-user PWA behind a Cloudflare tunnel, but should be revisited before any wider exposure (multi-user, public deploy). See `backend/chat_auth.py` TODO.
+- **No streaming responses.** Chat waits for the full Claude/gateway reply before rendering. Streaming can be added later via Server-Sent Events on `/chat/api/chats/{id}/message`.
+- **Markdown is rendered as plain text.** Claude's `**bold**` / `- bullet` syntax shows literally in the bubble. Intentional in v1 (no markdown lib dependency); upgrade to `marked` or similar when needed.
+- **Relay-mode session continuity** — `session_map` is populated but the openclaw_session_id is not yet passed through to the gateway request. Each chat creates a fresh OpenClaw session per call until that wire-up is added (see `backend/gateway_client.py` docstring).
+- **PWA service worker may cache stale chat assets.** If you ship a Chat-mode update and don't see it on your phone, hard-refresh once or bump `sw.js` cache version.
