@@ -1,38 +1,45 @@
 """
 Jarvis PWA Backend Server
 ─────────────────────────
-FastAPI server that handles both modes:
-  1. Talk to Jarvis  → /talk     (returns ElevenLabs voice response)
-  2. Ambient Record  → /ambient  (fires archive + action pipelines)
+Single-product surface: Chat. Text and voice in one composer, persisted
+to a single sqlite chat thread per conversation. The previous Talk /
+Record / Memos endpoints and their tables are gone — Chat does it all.
+
+Endpoints:
+  /api/health                                     open status probe
+  POST /chat/api/login                            single-password gate
+  POST /chat/api/logout
+  GET  /chat/api/auth-status
+  GET  /chat/api/chats                            sidebar list (auth)
+  POST /chat/api/chats                            mint new chat (auth)
+  GET  /chat/api/chats/{id}/messages              chat history (auth)
+  POST /chat/api/chats/{id}/message               text turn (auth)
+  POST /chat/api/chats/{id}/voice-message         voice turn (auth)
+  GET  /chat/api/audio/{filename}                 stream cached audio (auth)
 
 Runs on Mac Mini, exposed via Cloudflare tunnel.
 """
 
-import asyncio
-import base64
 import io
-import json
 import logging
 import os
+import re
 import sqlite3
-import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import httpx
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
-from action_extractor import extract_actions, archive_summarize
 from chat_auth import (
     clear_session_cookie,
     is_authenticated,
@@ -40,7 +47,6 @@ from chat_auth import (
     require_auth,
     verify_password,
 )
-from discord_poster import post_action_items_to_discord
 from elevenlabs_tts import synthesize_voice
 import gateway_client
 from jarvis_brain import JARVIS_VOICE_SYSTEM, answer_with_voice_brain
@@ -68,11 +74,6 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "9IzcwKmvwJcw58h3KnlH")
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_JARVIS_CHANNEL_ID = os.getenv("DISCORD_JARVIS_CHANNEL_ID")
-DISCORD_VOICE_MEMO_CHANNEL_ID = os.getenv(
-    "DISCORD_VOICE_MEMO_CHANNEL_ID", DISCORD_JARVIS_CHANNEL_ID
-)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,46 +84,13 @@ log = logging.getLogger("jarvis-pwa")
 # ──────────────────────────────────────────────────────────────────────────
 # DATABASE
 # ──────────────────────────────────────────────────────────────────────────
+#
+# Three tables that matter post-refactor: chats, messages, session_map.
+# voice_memos / action_items / talk_history still exist on disk in
+# pre-refactor installs — they're left in place by this commit and
+# dropped in the next.
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS voice_memos (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    recorded_at     DATETIME NOT NULL,
-    duration_seconds INTEGER,
-    raw_transcript  TEXT NOT NULL,
-    summary         TEXT,
-    key_ideas       TEXT,            -- JSON array
-    tags            TEXT,            -- JSON array
-    mood            TEXT,
-    audio_path      TEXT,
-    processed       INTEGER DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS action_items (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    memo_id         INTEGER,
-    created_at      DATETIME NOT NULL,
-    task            TEXT NOT NULL,
-    priority        TEXT,
-    project_tag     TEXT,
-    discord_posted  INTEGER DEFAULT 0,
-    FOREIGN KEY (memo_id) REFERENCES voice_memos(id)
-);
-
-CREATE TABLE IF NOT EXISTS talk_history (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    spoken_at       DATETIME NOT NULL,
-    user_text       TEXT NOT NULL,
-    jarvis_text     TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_memos_date ON voice_memos(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_actions_memo ON action_items(memo_id);
-
--- ── Chat mode (Mode 4) ───────────────────────────────────────────────
--- `origin` is 'chat' for chats created via the Chat tab, 'talk' for
--- chats created by a Talk session. Existing rows are backfilled to
--- 'chat' by the DEFAULT clause + migration step in init_db().
 CREATE TABLE IF NOT EXISTS chats (
     chat_id         TEXT PRIMARY KEY,
     title           TEXT,
@@ -137,6 +105,8 @@ CREATE TABLE IF NOT EXISTS messages (
     role        TEXT CHECK(role IN ('user','assistant')),
     content     TEXT,
     created_at  TEXT,
+    has_audio   INTEGER DEFAULT 0,
+    audio_url   TEXT,
     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
 );
 
@@ -151,23 +121,40 @@ CREATE INDEX IF NOT EXISTS idx_chats_last_message_at ON chats(last_message_at DE
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
 """
 
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
+    """
+    Idempotent schema bootstrap + migration. Safe to run repeatedly.
+    Adds columns to existing installs that predate them; new installs
+    get the columns from the CREATE TABLE statements above.
+    """
     with db() as conn:
         conn.executescript(SCHEMA)
-        # Migration: add chats.origin column for installs that predate
-        # Talk-via-gateway. SQLite's ADD COLUMN doesn't support IF NOT
-        # EXISTS, so check via PRAGMA. New installs get the column from
-        # the CREATE TABLE above and skip this branch.
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(chats)").fetchall()}
-        if "origin" not in cols:
+
+        # chats.origin — added in the Talk-via-gateway change.
+        chat_cols = {r["name"] for r in conn.execute("PRAGMA table_info(chats)").fetchall()}
+        if "origin" not in chat_cols:
             conn.execute("ALTER TABLE chats ADD COLUMN origin TEXT DEFAULT 'chat'")
             log.info("Migration: added chats.origin column")
+
+        # messages.has_audio / messages.audio_url — added in the single-Chat
+        # voice-in-composer change.
+        msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "has_audio" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN has_audio INTEGER DEFAULT 0")
+            log.info("Migration: added messages.has_audio column")
+        if "audio_url" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN audio_url TEXT")
+            log.info("Migration: added messages.audio_url column")
+
     log.info(f"Database ready at {DB_PATH}")
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # SHARED CLIENTS
@@ -175,6 +162,7 @@ def init_db():
 
 openai_client: Optional[AsyncOpenAI] = None
 anthropic_client: Optional[AsyncAnthropic] = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -193,6 +181,7 @@ async def lifespan(app: FastAPI):
     yield
     log.info("Shutting down.")
 
+
 app = FastAPI(lifespan=lifespan, title="Jarvis PWA Backend")
 app.add_middleware(
     CORSMiddleware,
@@ -204,6 +193,11 @@ app.add_middleware(
 # ──────────────────────────────────────────────────────────────────────────
 # CORE HELPERS
 # ──────────────────────────────────────────────────────────────────────────
+
+# Audio filenames are <uuid4hex>.<webm|mp3>. Strict regex so path
+# components / ".." can't slip through GET /chat/api/audio/{filename}.
+_AUDIO_FILENAME_RE = re.compile(r"^[0-9a-f]{32}\.(webm|mp3)$")
+
 
 async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
     """Run audio through OpenAI Whisper, return text."""
@@ -217,312 +211,6 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> 
         response_format="text",
     )
     return str(transcript).strip()
-
-def save_audio_cache(audio_bytes: bytes, prefix: str) -> Path:
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = AUDIO_CACHE_DIR / f"{prefix}_{ts}.webm"
-    path.write_bytes(audio_bytes)
-    return path
-
-# ──────────────────────────────────────────────────────────────────────────
-# ENDPOINTS
-# ──────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/health")
-async def health():
-    return {
-        "ok": True,
-        "openai": bool(openai_client),
-        "anthropic": bool(anthropic_client),
-        "elevenlabs": bool(ELEVENLABS_API_KEY),
-        "discord": bool(DISCORD_BOT_TOKEN and DISCORD_JARVIS_CHANNEL_ID),
-        "time": datetime.utcnow().isoformat(),
-    }
-
-# ── MODE 1: TALK TO JARVIS ────────────────────────────────────────────────
-
-@app.post("/api/talk", dependencies=[Depends(require_auth)])
-async def talk(
-    audio: UploadFile = File(...),
-    chat_id: Optional[str] = Form(None),
-):
-    """
-    Two-way conversation. Spencer speaks → Jarvis responds in voice.
-
-    Routes through the OpenClaw gateway (so the full Jarvis brain with
-    skills is available — `create_task`, `send_email`, etc.) and
-    persists both the user transcript and the assistant reply into the
-    chats/messages tables for visibility in the Chat tab.
-
-    The frontend SHOULD pass `chat_id` from /chat/api/talk-session/new
-    so every audio clip in one Talk session lands in the same chat
-    thread. If `chat_id` is missing, we mint one on the fly
-    (origin='talk') and return it to the client via X-Chat-Id.
-
-    On gateway failure, falls back to a direct Anthropic call with the
-    same short-form voice prompt so Spencer still hears a reply.
-    Persistence still runs in the fallback path; skills don't.
-
-    Returns: mp3 audio of Jarvis's reply with X-User-Text / X-Jarvis-Text
-    / X-Chat-Id headers (text fields are base64-encoded to survive HTTP
-    header constraints).
-    """
-    t0 = time.time()
-    audio_bytes = await audio.read()
-    log.info(f"[TALK] received {len(audio_bytes)} bytes, chat_id={chat_id}")
-
-    transcript = await transcribe_audio(audio_bytes, filename=audio.filename or "audio.webm")
-    log.info(f"[TALK] heard: {transcript!r}")
-    if not transcript:
-        raise HTTPException(400, "Empty transcript")
-
-    # Defensive auto-mint if the frontend forgot to call /chat/api/talk-session/new.
-    if not chat_id:
-        chat_id = uuid.uuid4().hex
-        now = _now_iso()
-        openclaw_session_id = f"pwa:talk:{chat_id}"
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO chats (chat_id, title, created_at, last_message_at, origin) "
-                "VALUES (?, NULL, ?, NULL, 'talk')",
-                (chat_id, now),
-            )
-            conn.execute(
-                "INSERT INTO session_map (chat_id, openclaw_session_id, created_at) "
-                "VALUES (?, ?, ?)",
-                (chat_id, openclaw_session_id, now),
-            )
-        log.info(f"[TALK] auto-minted chat {chat_id}")
-
-    _, reply_text, _ = await _exchange_turn(
-        chat_id=chat_id,
-        user_content=transcript,
-        system_prompt=JARVIS_VOICE_SYSTEM,
-        voice_fallback=True,
-    )
-    log.info(f"[TALK] reply: {reply_text!r}")
-
-    voice_bytes = await synthesize_voice(
-        text=reply_text,
-        api_key=ELEVENLABS_API_KEY,
-        voice_id=ELEVENLABS_VOICE_ID,
-        model=ELEVENLABS_MODEL,
-    )
-
-    log.info(f"[TALK] round-trip {time.time()-t0:.2f}s")
-
-    return Response(
-        content=voice_bytes,
-        media_type="audio/mpeg",
-        headers={
-            "X-User-Text": base64.b64encode(transcript.encode()).decode(),
-            "X-Jarvis-Text": base64.b64encode(reply_text.encode()).decode(),
-            "X-Chat-Id": chat_id,
-        },
-    )
-
-# ── MODE 2: AMBIENT RECORDING ─────────────────────────────────────────────
-
-@app.post("/api/ambient", dependencies=[Depends(require_auth)])
-async def ambient(
-    audio: UploadFile = File(...),
-    duration_seconds: int = Form(0),
-):
-    """
-    One-way recording. Spencer thinks out loud → pipelines fire async.
-    Returns immediately with memo_id once transcript is captured.
-    """
-    t0 = time.time()
-    audio_bytes = await audio.read()
-    log.info(f"[AMBIENT] received {len(audio_bytes)} bytes, duration={duration_seconds}s")
-
-    transcript = await transcribe_audio(audio_bytes, filename=audio.filename or "audio.webm")
-    if not transcript:
-        raise HTTPException(400, "Empty transcript")
-    log.info(f"[AMBIENT] transcribed {len(transcript)} chars in {time.time()-t0:.2f}s")
-
-    audio_path = save_audio_cache(audio_bytes, "ambient")
-
-    # Insert memo shell so we have an ID to attach actions to
-    with db() as conn:
-        cur = conn.execute(
-            """INSERT INTO voice_memos
-               (recorded_at, duration_seconds, raw_transcript, audio_path)
-               VALUES (?, ?, ?, ?)""",
-            (datetime.utcnow().isoformat(), duration_seconds, transcript, str(audio_path)),
-        )
-        memo_id = cur.lastrowid
-    log.info(f"[AMBIENT] memo_id={memo_id}")
-
-    # Fire both pipelines in parallel, don't block response
-    asyncio.create_task(_process_ambient_pipelines(memo_id, transcript))
-
-    return {
-        "ok": True,
-        "memo_id": memo_id,
-        "transcript_preview": transcript[:200],
-        "duration_seconds": duration_seconds,
-    }
-
-async def _process_ambient_pipelines(memo_id: int, transcript: str):
-    """Run archive + action pipelines in parallel after response is sent."""
-    try:
-        log.info(f"[PIPELINE {memo_id}] starting parallel pipelines")
-        archive_task = asyncio.create_task(archive_summarize(anthropic_client, transcript))
-        action_task = asyncio.create_task(extract_actions(anthropic_client, transcript))
-
-        archive_result, action_result = await asyncio.gather(
-            archive_task, action_task, return_exceptions=True
-        )
-
-        # ── Archive branch ─────────────────────────────
-        if isinstance(archive_result, Exception):
-            log.exception(f"[PIPELINE {memo_id}] archive failed", exc_info=archive_result)
-        else:
-            with db() as conn:
-                conn.execute(
-                    """UPDATE voice_memos
-                       SET summary=?, key_ideas=?, tags=?, mood=?, processed=1
-                       WHERE id=?""",
-                    (
-                        archive_result.get("summary"),
-                        json.dumps(archive_result.get("key_ideas", [])),
-                        json.dumps(archive_result.get("tags", [])),
-                        archive_result.get("mood"),
-                        memo_id,
-                    ),
-                )
-            log.info(f"[PIPELINE {memo_id}] archive saved")
-
-        # ── Action branch ──────────────────────────────
-        if isinstance(action_result, Exception):
-            log.exception(f"[PIPELINE {memo_id}] actions failed", exc_info=action_result)
-            return
-
-        actions = action_result.get("actions", [])
-        ideas = action_result.get("ideas", [])
-        decisions = action_result.get("decisions", [])
-
-        with db() as conn:
-            for a in actions:
-                conn.execute(
-                    """INSERT INTO action_items
-                       (memo_id, created_at, task, priority, project_tag)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        memo_id,
-                        datetime.utcnow().isoformat(),
-                        a.get("task"),
-                        a.get("priority"),
-                        a.get("project"),
-                    ),
-                )
-
-        # Post structured digest to Discord for Jarvis to action
-        if DISCORD_BOT_TOKEN and DISCORD_VOICE_MEMO_CHANNEL_ID:
-            await post_action_items_to_discord(
-                bot_token=DISCORD_BOT_TOKEN,
-                channel_id=DISCORD_VOICE_MEMO_CHANNEL_ID,
-                memo_id=memo_id,
-                duration_seconds=_get_memo_duration(memo_id),
-                actions=actions,
-                ideas=ideas,
-                decisions=decisions,
-                summary=archive_result.get("summary") if isinstance(archive_result, dict) else None,
-            )
-            log.info(f"[PIPELINE {memo_id}] posted to Discord")
-
-    except Exception:
-        log.exception(f"[PIPELINE {memo_id}] unexpected failure")
-
-def _get_memo_duration(memo_id: int) -> int:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT duration_seconds FROM voice_memos WHERE id=?", (memo_id,)
-        ).fetchone()
-    return row["duration_seconds"] if row else 0
-
-# ── ARCHIVE ENDPOINTS (for Spencer to browse later) ───────────────────────
-
-@app.get("/api/memos", dependencies=[Depends(require_auth)])
-async def list_memos(limit: int = 50):
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT id, recorded_at, duration_seconds, summary, key_ideas, tags, mood
-               FROM voice_memos
-               ORDER BY recorded_at DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
-    return [
-        {
-            "id": r["id"],
-            "recorded_at": r["recorded_at"],
-            "duration_seconds": r["duration_seconds"],
-            "summary": r["summary"],
-            "key_ideas": json.loads(r["key_ideas"] or "[]"),
-            "tags": json.loads(r["tags"] or "[]"),
-            "mood": r["mood"],
-        }
-        for r in rows
-    ]
-
-@app.get("/api/memos/{memo_id}", dependencies=[Depends(require_auth)])
-async def memo_detail(memo_id: int):
-    with db() as conn:
-        memo = conn.execute(
-            "SELECT * FROM voice_memos WHERE id=?", (memo_id,)
-        ).fetchone()
-        if not memo:
-            raise HTTPException(404, "Not found")
-        actions = conn.execute(
-            "SELECT task, priority, project_tag FROM action_items WHERE memo_id=?",
-            (memo_id,),
-        ).fetchall()
-    return {
-        "id": memo["id"],
-        "recorded_at": memo["recorded_at"],
-        "duration_seconds": memo["duration_seconds"],
-        "raw_transcript": memo["raw_transcript"],
-        "summary": memo["summary"],
-        "key_ideas": json.loads(memo["key_ideas"] or "[]"),
-        "tags": json.loads(memo["tags"] or "[]"),
-        "mood": memo["mood"],
-        "actions": [dict(a) for a in actions],
-    }
-
-# ──────────────────────────────────────────────────────────────────────────
-# MODE 4: CHAT — AUTH ENDPOINTS
-# ──────────────────────────────────────────────────────────────────────────
-
-class LoginRequest(BaseModel):
-    password: str
-
-
-@app.post("/chat/api/login")
-async def chat_login(req: LoginRequest, response: Response):
-    if not verify_password(req.password):
-        raise HTTPException(401, "invalid password")
-    issue_session_cookie(response)
-    return {"ok": True}
-
-
-@app.post("/chat/api/logout")
-async def chat_logout(response: Response):
-    clear_session_cookie(response)
-    return {"ok": True}
-
-
-@app.get("/chat/api/auth-status")
-async def chat_auth_status(request: Request):
-    return {"authenticated": is_authenticated(request)}
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# MODE 4: CHAT — CRUD ENDPOINTS
-# ──────────────────────────────────────────────────────────────────────────
-
-class MessageRequest(BaseModel):
-    content: str
 
 
 def _now_iso() -> str:
@@ -541,19 +229,23 @@ async def _exchange_turn(
     user_content: str,
     system_prompt: Optional[str] = None,
     voice_fallback: bool = False,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str]:
     """
     Append one user → assistant turn to an existing chat.
 
     Steps: insert user msg, auto-title chat if title is null, load full
     history, call gateway with optional system_prompt, insert assistant
-    msg, bump last_message_at. Returns (assistant_msg_id, assistant_text,
-    assistant_created_at).
+    msg, bump last_message_at.
+
+    Returns (user_msg_id, assistant_msg_id, assistant_text,
+    assistant_created_at). The voice-message endpoint uses user_msg_id
+    + assistant_msg_id to UPDATE both rows with audio metadata after
+    the gateway round-trip.
 
     Raises 404 if chat_id does not exist. Raises 502 if the gateway
     errors AND voice_fallback is False. If voice_fallback is True, on
     gateway error we instead call answer_with_voice_brain() directly
-    via Anthropic so Talk mode still produces a spoken reply.
+    via Anthropic so the voice path still produces a spoken reply.
     """
     with db() as conn:
         chat_row = conn.execute(
@@ -614,18 +306,86 @@ async def _exchange_turn(
             (assistant_now, chat_id),
         )
 
-    return assistant_msg_id, reply_text, assistant_now
+    return user_msg_id, assistant_msg_id, reply_text, assistant_now
+
+
+def _set_message_audio(message_id: str, audio_url: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE messages SET has_audio = 1, audio_url = ? WHERE message_id = ?",
+            (audio_url, message_id),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# ENDPOINTS
+# ──────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+async def health():
+    return {
+        "ok": True,
+        "openai": bool(openai_client),
+        "anthropic": bool(anthropic_client),
+        "elevenlabs": bool(ELEVENLABS_API_KEY),
+        "time": datetime.utcnow().isoformat(),
+    }
+
+
+# ── AUTH ──────────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.post("/chat/api/login")
+async def chat_login(req: LoginRequest, response: Response):
+    if not verify_password(req.password):
+        raise HTTPException(401, "invalid password")
+    issue_session_cookie(response)
+    return {"ok": True}
+
+
+@app.post("/chat/api/logout")
+async def chat_logout(response: Response):
+    clear_session_cookie(response)
+    return {"ok": True}
+
+
+@app.get("/chat/api/auth-status")
+async def chat_auth_status(request: Request):
+    return {"authenticated": is_authenticated(request)}
+
+
+# ── CHAT CRUD ─────────────────────────────────────────────────────────────
+
+class MessageRequest(BaseModel):
+    content: str
 
 
 @app.get("/chat/api/chats", dependencies=[Depends(require_auth)])
 async def chat_list_chats():
+    """
+    Returns the sidebar listing. `has_audio` is an aggregate — true if
+    any message in this chat has audio (so the frontend can flag mixed
+    conversations with the 🎙️ icon, in addition to origin='talk' chats
+    that came from the deprecated Talk surface).
+    """
     with db() as conn:
         rows = conn.execute(
-            """SELECT chat_id, title, created_at, last_message_at, origin
-               FROM chats
-               ORDER BY COALESCE(last_message_at, created_at) DESC"""
+            """SELECT c.chat_id, c.title, c.created_at, c.last_message_at,
+                      c.origin,
+                      EXISTS (
+                          SELECT 1 FROM messages m
+                          WHERE m.chat_id = c.chat_id AND m.has_audio = 1
+                      ) AS has_audio
+               FROM chats c
+               ORDER BY COALESCE(c.last_message_at, c.created_at) DESC"""
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [
+        {**dict(r), "has_audio": bool(r["has_audio"])}
+        for r in rows
+    ]
 
 
 @app.post("/chat/api/chats", dependencies=[Depends(require_auth)])
@@ -656,25 +416,28 @@ async def chat_get_messages(chat_id: str):
         if not chat:
             raise HTTPException(404, "chat not found")
         rows = conn.execute(
-            """SELECT message_id, role, content, created_at
+            """SELECT message_id, role, content, created_at, has_audio, audio_url
                FROM messages
                WHERE chat_id = ?
                ORDER BY created_at ASC, message_id ASC""",
             (chat_id,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [
+        {**dict(r), "has_audio": bool(r["has_audio"])}
+        for r in rows
+    ]
 
 
 @app.post("/chat/api/chats/{chat_id}/message", dependencies=[Depends(require_auth)])
 async def chat_send_message(chat_id: str, req: MessageRequest):
+    """Text turn. No audio attachments produced."""
     content = (req.content or "").strip()
     if not content:
         raise HTTPException(400, "content required")
 
-    assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
+    _, assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
         chat_id=chat_id,
         user_content=content,
-        # No system_prompt override → gateway_client uses its mode default.
         voice_fallback=False,
     )
     return {
@@ -683,33 +446,113 @@ async def chat_send_message(chat_id: str, req: MessageRequest):
         "role": "assistant",
         "content": reply_text,
         "created_at": assistant_now,
+        "has_audio": False,
+        "audio_url": None,
     }
 
 
-@app.post("/chat/api/talk-session/new", dependencies=[Depends(require_auth)])
-async def chat_talk_session_new():
-    """Mint a chat thread to host one Talk-mode session.
-
-    The frontend calls this on Talk-tab activation and passes the
-    returned chat_id along with every /api/talk request until the user
-    leaves the tab. Title is left NULL so the first user transcript
-    auto-titles the chat (same convention as Chat-tab chats).
+@app.post("/chat/api/chats/{chat_id}/voice-message", dependencies=[Depends(require_auth)])
+async def chat_voice_message(
+    chat_id: str,
+    audio: UploadFile = File(...),
+):
     """
-    chat_id = uuid.uuid4().hex
-    now = _now_iso()
-    openclaw_session_id = f"pwa:talk:{chat_id}"
+    Voice turn. User holds the composer mic, releases, and audio lands
+    here. We Whisper-transcribe, persist the user turn (with the raw
+    audio file URL), run the gateway with the short-form voice prompt,
+    persist the assistant turn, ElevenLabs-synthesize the reply, save
+    that file, attach its URL to the assistant message, and return both
+    message rows.
+
+    Frontend renders user + assistant bubbles (each with a 🎙️ + replay
+    button) and auto-plays the assistant audio.
+    """
+    audio_bytes = await audio.read()
+    log.info(f"[VOICE {chat_id}] received {len(audio_bytes)} bytes")
+
+    # Verify the chat exists before doing any expensive work.
     with db() as conn:
-        conn.execute(
-            "INSERT INTO chats (chat_id, title, created_at, last_message_at, origin) "
-            "VALUES (?, NULL, ?, NULL, 'talk')",
-            (chat_id, now),
+        if not conn.execute(
+            "SELECT 1 FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone():
+            raise HTTPException(404, "chat not found")
+
+    transcript = await transcribe_audio(
+        audio_bytes, filename=audio.filename or "voice.webm"
+    )
+    log.info(f"[VOICE {chat_id}] heard: {transcript!r}")
+    if not transcript:
+        # Whisper returned empty — likely sub-second / silent audio. The
+        # frontend already silently discards <1s clips, so a 400 here is
+        # a defensive fallback rather than a user-visible error.
+        raise HTTPException(400, "Empty transcript")
+
+    # Save the user's raw audio so the bubble can replay it later.
+    user_audio_name = f"{uuid.uuid4().hex}.webm"
+    (AUDIO_CACHE_DIR / user_audio_name).write_bytes(audio_bytes)
+    user_audio_url = f"/chat/api/audio/{user_audio_name}"
+
+    # Persist user → gateway → assistant.
+    user_msg_id, assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
+        chat_id=chat_id,
+        user_content=transcript,
+        system_prompt=JARVIS_VOICE_SYSTEM,
+        voice_fallback=True,
+    )
+    _set_message_audio(user_msg_id, user_audio_url)
+
+    # ElevenLabs TTS — if it fails, the assistant message still exists,
+    # just without playback. Frontend handles `audio_url=null` gracefully.
+    assistant_audio_url: Optional[str] = None
+    try:
+        voice_bytes = await synthesize_voice(
+            text=reply_text,
+            api_key=ELEVENLABS_API_KEY,
+            voice_id=ELEVENLABS_VOICE_ID,
+            model=ELEVENLABS_MODEL,
         )
-        conn.execute(
-            "INSERT INTO session_map (chat_id, openclaw_session_id, created_at) "
-            "VALUES (?, ?, ?)",
-            (chat_id, openclaw_session_id, now),
-        )
-    return {"chat_id": chat_id, "openclaw_session_id": openclaw_session_id}
+        assistant_audio_name = f"{uuid.uuid4().hex}.mp3"
+        (AUDIO_CACHE_DIR / assistant_audio_name).write_bytes(voice_bytes)
+        assistant_audio_url = f"/chat/api/audio/{assistant_audio_name}"
+        _set_message_audio(assistant_msg_id, assistant_audio_url)
+    except Exception:
+        log.exception(f"[VOICE {chat_id}] TTS failed; assistant text only")
+
+    return {
+        "user_message": {
+            "message_id": user_msg_id,
+            "chat_id": chat_id,
+            "role": "user",
+            "content": transcript,
+            "has_audio": True,
+            "audio_url": user_audio_url,
+        },
+        "assistant_message": {
+            "message_id": assistant_msg_id,
+            "chat_id": chat_id,
+            "role": "assistant",
+            "content": reply_text,
+            "created_at": assistant_now,
+            "has_audio": bool(assistant_audio_url),
+            "audio_url": assistant_audio_url,
+        },
+    }
+
+
+@app.get("/chat/api/audio/{filename}", dependencies=[Depends(require_auth)])
+async def chat_audio(filename: str):
+    """
+    Stream a cached audio file. Filename must match the strict
+    <uuid4hex>.<webm|mp3> shape so a malicious caller can't traverse
+    out of AUDIO_CACHE_DIR via path components or `..`.
+    """
+    if not _AUDIO_FILENAME_RE.match(filename):
+        raise HTTPException(400, "invalid filename")
+    path = AUDIO_CACHE_DIR / filename
+    if not path.is_file():
+        raise HTTPException(404, "audio not found")
+    media_type = "audio/webm" if filename.endswith(".webm") else "audio/mpeg"
+    return FileResponse(str(path), media_type=media_type)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -718,6 +561,7 @@ async def chat_talk_session_new():
 
 if FRONTEND_DIR.exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+
 
 if __name__ == "__main__":
     import uvicorn
