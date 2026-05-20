@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Jarvis" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+  <title>Jarvis</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="app">
+
+    <header class="top-bar">
+      <div class="brand">
+        <span class="brand-mark">▲</span>
+        <span class="brand-name">JARVIS</span>
+      </div>
+      <div class="status" id="status">
+        <span class="status-dot"></span>
+        <span class="status-text" id="statusText">ready</span>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-mode="talk">
+        <span class="tab-num">01</span>
+        <span class="tab-label">Talk</span>
+      </button>
+      <button class="tab" data-mode="ambient">
+        <span class="tab-num">02</span>
+        <span class="tab-label">Record</span>
+      </button>
+      <button class="tab" data-mode="archive">
+        <span class="tab-num">03</span>
+        <span class="tab-label">Memos</span>
+      </button>
+    </nav>
+
+    <main class="stage">
+      <!-- ───── MODE 1: TALK ───── -->
+      <section class="screen screen-talk active" data-screen="talk">
+        <div class="screen-meta">
+          <span class="meta-label">mode</span>
+          <span class="meta-value">two-way · voice</span>
+        </div>
+
+        <div class="orb-stage">
+          <div class="orb" id="talkOrb">
+            <div class="orb-ring orb-ring-1"></div>
+            <div class="orb-ring orb-ring-2"></div>
+            <div class="orb-ring orb-ring-3"></div>
+            <div class="orb-core"></div>
+          </div>
+        </div>
+
+        <div class="caption" id="talkCaption">Hold to talk</div>
+
+        <button class="primary-button" id="talkButton">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 1a4 4 0 0 0-4 4v6a4 4 0 0 0 8 0V5a4 4 0 0 0-4-4z"/>
+            <path d="M19 10v1a7 7 0 0 1-14 0v-1"/>
+            <line x1="12" y1="18" x2="12" y2="22"/>
+            <line x1="8" y1="22" x2="16" y2="22"/>
+          </svg>
+        </button>
+
+        <div class="transcript-pane" id="talkTranscript"></div>
+      </section>
+
+      <!-- ───── MODE 2: AMBIENT ───── -->
+      <section class="screen screen-ambient" data-screen="ambient">
+        <div class="screen-meta">
+          <span class="meta-label">mode</span>
+          <span class="meta-value">ambient · think out loud</span>
+        </div>
+
+        <div class="recorder-display">
+          <div class="recorder-time" id="recorderTime">00:00</div>
+          <div class="recorder-state" id="recorderState">idle</div>
+          <canvas id="waveform" class="waveform"></canvas>
+        </div>
+
+        <div class="recorder-explain">
+          Hit record. Talk through anything.<br/>
+          Stop when you're done — Jarvis does the rest.
+        </div>
+
+        <button class="primary-button record-button" id="recordButton">
+          <span class="record-dot"></span>
+        </button>
+
+        <div class="processing-pane" id="processingPane">
+          <div class="proc-step" data-step="upload">⬆  Uploading audio</div>
+          <div class="proc-step" data-step="transcribe">⌁  Transcribing</div>
+          <div class="proc-step" data-step="extract">⚡ Extracting tasks</div>
+          <div class="proc-step" data-step="post">↗  Pushing to Jarvis</div>
+        </div>
+      </section>
+
+      <!-- ───── MODE 3: ARCHIVE ───── -->
+      <section class="screen screen-archive" data-screen="archive">
+        <div class="screen-meta">
+          <span class="meta-label">archive</span>
+          <span class="meta-value" id="memoCount">— memos</span>
+        </div>
+
+        <button class="ghost-button" id="refreshMemos">↻ refresh</button>
+
+        <div class="memo-list" id="memoList">
+          <div class="memo-empty">No memos yet. Record something.</div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>34dev · jarvis · v1</span>
+    </footer>
+  </div>
+
+  <!-- Memo detail modal -->
+  <div class="modal-backdrop" id="memoModal">
+    <div class="modal">
+      <button class="modal-close" id="modalClose">×</button>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
