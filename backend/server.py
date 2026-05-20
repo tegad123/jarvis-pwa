@@ -43,7 +43,7 @@ from chat_auth import (
 from discord_poster import post_action_items_to_discord
 from elevenlabs_tts import synthesize_voice
 import gateway_client
-from jarvis_brain import answer_with_jarvis_context
+from jarvis_brain import JARVIS_VOICE_SYSTEM, answer_with_voice_brain
 
 # ──────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -120,11 +120,15 @@ CREATE INDEX IF NOT EXISTS idx_memos_date ON voice_memos(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_actions_memo ON action_items(memo_id);
 
 -- ── Chat mode (Mode 4) ───────────────────────────────────────────────
+-- `origin` is 'chat' for chats created via the Chat tab, 'talk' for
+-- chats created by a Talk session. Existing rows are backfilled to
+-- 'chat' by the DEFAULT clause + migration step in init_db().
 CREATE TABLE IF NOT EXISTS chats (
     chat_id         TEXT PRIMARY KEY,
     title           TEXT,
     created_at      TEXT,
-    last_message_at TEXT
+    last_message_at TEXT,
+    origin          TEXT DEFAULT 'chat'
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -155,6 +159,14 @@ def db():
 def init_db():
     with db() as conn:
         conn.executescript(SCHEMA)
+        # Migration: add chats.origin column for installs that predate
+        # Talk-via-gateway. SQLite's ADD COLUMN doesn't support IF NOT
+        # EXISTS, so check via PRAGMA. New installs get the column from
+        # the CREATE TABLE above and skip this branch.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(chats)").fetchall()}
+        if "origin" not in cols:
+            conn.execute("ALTER TABLE chats ADD COLUMN origin TEXT DEFAULT 'chat'")
+            log.info("Migration: added chats.origin column")
     log.info(f"Database ready at {DB_PATH}")
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -229,25 +241,64 @@ async def health():
 
 # ── MODE 1: TALK TO JARVIS ────────────────────────────────────────────────
 
-@app.post("/api/talk")
-async def talk(audio: UploadFile = File(...)):
+@app.post("/api/talk", dependencies=[Depends(require_auth)])
+async def talk(
+    audio: UploadFile = File(...),
+    chat_id: Optional[str] = Form(None),
+):
     """
     Two-way conversation. Spencer speaks → Jarvis responds in voice.
-    Returns: mp3 audio of Jarvis's reply (+ headers with text).
+
+    Routes through the OpenClaw gateway (so the full Jarvis brain with
+    skills is available — `create_task`, `send_email`, etc.) and
+    persists both the user transcript and the assistant reply into the
+    chats/messages tables for visibility in the Chat tab.
+
+    The frontend SHOULD pass `chat_id` from /chat/api/talk-session/new
+    so every audio clip in one Talk session lands in the same chat
+    thread. If `chat_id` is missing, we mint one on the fly
+    (origin='talk') and return it to the client via X-Chat-Id.
+
+    On gateway failure, falls back to a direct Anthropic call with the
+    same short-form voice prompt so Spencer still hears a reply.
+    Persistence still runs in the fallback path; skills don't.
+
+    Returns: mp3 audio of Jarvis's reply with X-User-Text / X-Jarvis-Text
+    / X-Chat-Id headers (text fields are base64-encoded to survive HTTP
+    header constraints).
     """
     t0 = time.time()
     audio_bytes = await audio.read()
-    log.info(f"[TALK] received {len(audio_bytes)} bytes")
+    log.info(f"[TALK] received {len(audio_bytes)} bytes, chat_id={chat_id}")
 
     transcript = await transcribe_audio(audio_bytes, filename=audio.filename or "audio.webm")
     log.info(f"[TALK] heard: {transcript!r}")
     if not transcript:
         raise HTTPException(400, "Empty transcript")
 
-    reply_text = await answer_with_jarvis_context(
-        anthropic_client,
-        user_message=transcript,
-        recent_history=_recent_talk_history(),
+    # Defensive auto-mint if the frontend forgot to call /chat/api/talk-session/new.
+    if not chat_id:
+        chat_id = uuid.uuid4().hex
+        now = _now_iso()
+        openclaw_session_id = f"pwa:talk:{chat_id}"
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO chats (chat_id, title, created_at, last_message_at, origin) "
+                "VALUES (?, NULL, ?, NULL, 'talk')",
+                (chat_id, now),
+            )
+            conn.execute(
+                "INSERT INTO session_map (chat_id, openclaw_session_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (chat_id, openclaw_session_id, now),
+            )
+        log.info(f"[TALK] auto-minted chat {chat_id}")
+
+    _, reply_text, _ = await _exchange_turn(
+        chat_id=chat_id,
+        user_content=transcript,
+        system_prompt=JARVIS_VOICE_SYSTEM,
+        voice_fallback=True,
     )
     log.info(f"[TALK] reply: {reply_text!r}")
 
@@ -258,12 +309,6 @@ async def talk(audio: UploadFile = File(...)):
         model=ELEVENLABS_MODEL,
     )
 
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO talk_history (spoken_at, user_text, jarvis_text) VALUES (?,?,?)",
-            (datetime.utcnow().isoformat(), transcript, reply_text),
-        )
-
     log.info(f"[TALK] round-trip {time.time()-t0:.2f}s")
 
     return Response(
@@ -272,24 +317,13 @@ async def talk(audio: UploadFile = File(...)):
         headers={
             "X-User-Text": base64.b64encode(transcript.encode()).decode(),
             "X-Jarvis-Text": base64.b64encode(reply_text.encode()).decode(),
+            "X-Chat-Id": chat_id,
         },
     )
 
-def _recent_talk_history(limit: int = 6) -> list[dict]:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT user_text, jarvis_text FROM talk_history ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    history = []
-    for row in reversed(rows):
-        history.append({"role": "user", "content": row["user_text"]})
-        history.append({"role": "assistant", "content": row["jarvis_text"]})
-    return history
-
 # ── MODE 2: AMBIENT RECORDING ─────────────────────────────────────────────
 
-@app.post("/api/ambient")
+@app.post("/api/ambient", dependencies=[Depends(require_auth)])
 async def ambient(
     audio: UploadFile = File(...),
     duration_seconds: int = Form(0),
@@ -410,7 +444,7 @@ def _get_memo_duration(memo_id: int) -> int:
 
 # ── ARCHIVE ENDPOINTS (for Spencer to browse later) ───────────────────────
 
-@app.get("/api/memos")
+@app.get("/api/memos", dependencies=[Depends(require_auth)])
 async def list_memos(limit: int = 50):
     with db() as conn:
         rows = conn.execute(
@@ -432,7 +466,7 @@ async def list_memos(limit: int = 50):
         for r in rows
     ]
 
-@app.get("/api/memos/{memo_id}")
+@app.get("/api/memos/{memo_id}", dependencies=[Depends(require_auth)])
 async def memo_detail(memo_id: int):
     with db() as conn:
         memo = conn.execute(
@@ -502,11 +536,92 @@ def _make_title(text: str, limit: int = 40) -> str:
     return text[:limit].rstrip() + "…"
 
 
+async def _exchange_turn(
+    chat_id: str,
+    user_content: str,
+    system_prompt: Optional[str] = None,
+    voice_fallback: bool = False,
+) -> tuple[str, str, str]:
+    """
+    Append one user → assistant turn to an existing chat.
+
+    Steps: insert user msg, auto-title chat if title is null, load full
+    history, call gateway with optional system_prompt, insert assistant
+    msg, bump last_message_at. Returns (assistant_msg_id, assistant_text,
+    assistant_created_at).
+
+    Raises 404 if chat_id does not exist. Raises 502 if the gateway
+    errors AND voice_fallback is False. If voice_fallback is True, on
+    gateway error we instead call answer_with_voice_brain() directly
+    via Anthropic so Talk mode still produces a spoken reply.
+    """
+    with db() as conn:
+        chat_row = conn.execute(
+            "SELECT title FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if not chat_row:
+            raise HTTPException(404, "chat not found")
+
+        user_msg_id = uuid.uuid4().hex
+        user_now = _now_iso()
+        conn.execute(
+            "INSERT INTO messages (message_id, chat_id, role, content, created_at) "
+            "VALUES (?, ?, 'user', ?, ?)",
+            (user_msg_id, chat_id, user_content, user_now),
+        )
+        if chat_row["title"] is None:
+            conn.execute(
+                "UPDATE chats SET title = ?, last_message_at = ? WHERE chat_id = ?",
+                (_make_title(user_content), user_now, chat_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE chats SET last_message_at = ? WHERE chat_id = ?",
+                (user_now, chat_id),
+            )
+
+        history_rows = conn.execute(
+            "SELECT role, content FROM messages WHERE chat_id = ? "
+            "ORDER BY created_at ASC, message_id ASC",
+            (chat_id,),
+        ).fetchall()
+
+    history = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+
+    try:
+        reply_text = await gateway_client.complete(
+            history,
+            anthropic_client=anthropic_client,
+            system_prompt=system_prompt,
+        )
+    except Exception:
+        log.exception(f"[CHAT {chat_id}] gateway call failed")
+        if not voice_fallback:
+            raise HTTPException(502, "gateway error")
+        log.warning(f"[CHAT {chat_id}] gateway down; falling back to direct voice brain")
+        reply_text = await answer_with_voice_brain(anthropic_client, history)
+
+    assistant_msg_id = uuid.uuid4().hex
+    assistant_now = _now_iso()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO messages (message_id, chat_id, role, content, created_at) "
+            "VALUES (?, ?, 'assistant', ?, ?)",
+            (assistant_msg_id, chat_id, reply_text, assistant_now),
+        )
+        conn.execute(
+            "UPDATE chats SET last_message_at = ? WHERE chat_id = ?",
+            (assistant_now, chat_id),
+        )
+
+    return assistant_msg_id, reply_text, assistant_now
+
+
 @app.get("/chat/api/chats", dependencies=[Depends(require_auth)])
 async def chat_list_chats():
     with db() as conn:
         rows = conn.execute(
-            """SELECT chat_id, title, created_at, last_message_at
+            """SELECT chat_id, title, created_at, last_message_at, origin
                FROM chats
                ORDER BY COALESCE(last_message_at, created_at) DESC"""
         ).fetchall()
@@ -556,61 +671,12 @@ async def chat_send_message(chat_id: str, req: MessageRequest):
     if not content:
         raise HTTPException(400, "content required")
 
-    with db() as conn:
-        chat_row = conn.execute(
-            "SELECT title FROM chats WHERE chat_id = ?", (chat_id,)
-        ).fetchone()
-        if not chat_row:
-            raise HTTPException(404, "chat not found")
-
-        user_msg_id = uuid.uuid4().hex
-        user_now = _now_iso()
-        conn.execute(
-            "INSERT INTO messages (message_id, chat_id, role, content, created_at) "
-            "VALUES (?, ?, 'user', ?, ?)",
-            (user_msg_id, chat_id, content, user_now),
-        )
-        if chat_row["title"] is None:
-            conn.execute(
-                "UPDATE chats SET title = ?, last_message_at = ? WHERE chat_id = ?",
-                (_make_title(content), user_now, chat_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE chats SET last_message_at = ? WHERE chat_id = ?",
-                (user_now, chat_id),
-            )
-
-        history_rows = conn.execute(
-            """SELECT role, content FROM messages
-               WHERE chat_id = ?
-               ORDER BY created_at ASC, message_id ASC""",
-            (chat_id,),
-        ).fetchall()
-
-    history = [{"role": r["role"], "content": r["content"]} for r in history_rows]
-
-    try:
-        reply_text = await gateway_client.complete(
-            history, anthropic_client=anthropic_client
-        )
-    except Exception:
-        log.exception(f"[CHAT {chat_id}] gateway call failed")
-        raise HTTPException(502, "gateway error")
-
-    assistant_msg_id = uuid.uuid4().hex
-    assistant_now = _now_iso()
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO messages (message_id, chat_id, role, content, created_at) "
-            "VALUES (?, ?, 'assistant', ?, ?)",
-            (assistant_msg_id, chat_id, reply_text, assistant_now),
-        )
-        conn.execute(
-            "UPDATE chats SET last_message_at = ? WHERE chat_id = ?",
-            (assistant_now, chat_id),
-        )
-
+    assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
+        chat_id=chat_id,
+        user_content=content,
+        # No system_prompt override → gateway_client uses its mode default.
+        voice_fallback=False,
+    )
     return {
         "message_id": assistant_msg_id,
         "chat_id": chat_id,
@@ -618,6 +684,32 @@ async def chat_send_message(chat_id: str, req: MessageRequest):
         "content": reply_text,
         "created_at": assistant_now,
     }
+
+
+@app.post("/chat/api/talk-session/new", dependencies=[Depends(require_auth)])
+async def chat_talk_session_new():
+    """Mint a chat thread to host one Talk-mode session.
+
+    The frontend calls this on Talk-tab activation and passes the
+    returned chat_id along with every /api/talk request until the user
+    leaves the tab. Title is left NULL so the first user transcript
+    auto-titles the chat (same convention as Chat-tab chats).
+    """
+    chat_id = uuid.uuid4().hex
+    now = _now_iso()
+    openclaw_session_id = f"pwa:talk:{chat_id}"
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO chats (chat_id, title, created_at, last_message_at, origin) "
+            "VALUES (?, NULL, ?, NULL, 'talk')",
+            (chat_id, now),
+        )
+        conn.execute(
+            "INSERT INTO session_map (chat_id, openclaw_session_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (chat_id, openclaw_session_id, now),
+        )
+    return {"chat_id": chat_id, "openclaw_session_id": openclaw_session_id}
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ log = logging.getLogger("jarvis-pwa.chat-auth")
 
 COOKIE_NAME = "jarvis_chat_session"
 COOKIE_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
-COOKIE_PATH = "/chat"
+COOKIE_PATH = "/"  # whole app: Talk/Record/Memos/Chat all share one session
 
 
 def _secret() -> bytes:

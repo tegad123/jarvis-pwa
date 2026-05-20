@@ -41,11 +41,14 @@ def current_mode() -> str:
 async def complete(
     messages: list[dict],
     anthropic_client: Optional[AsyncAnthropic] = None,
+    system_prompt: Optional[str] = None,
 ) -> str:
     """
     Send a conversation to whichever backend is configured.
 
     `messages` is a list of {role: 'user'|'assistant', content: str}.
+    `system_prompt`, if provided, overrides the default per-mode prompt
+    (used by Talk mode for the short-form voice prompt).
     Returns the assistant's reply text.
 
     Note: session_id passing to the relay gateway is intentionally
@@ -55,15 +58,16 @@ async def complete(
     """
     mode = current_mode()
     if mode == "mock":
-        return await _mock_complete(messages, anthropic_client)
+        return await _mock_complete(messages, anthropic_client, system_prompt)
     if mode == "relay":
-        return await _relay_complete(messages)
+        return await _relay_complete(messages, system_prompt)
     raise RuntimeError(f"Unknown JARVIS_GATEWAY_MODE: {mode!r}")
 
 
 async def _mock_complete(
     messages: list[dict],
     anthropic_client: Optional[AsyncAnthropic],
+    system_prompt: Optional[str],
 ) -> str:
     client = anthropic_client
     if client is None:
@@ -75,17 +79,21 @@ async def _mock_complete(
             )
         client = AsyncAnthropic(api_key=api_key)
 
+    system = system_prompt or MOCK_SYSTEM_PROMPT
     log.info(f"[gateway:mock] {len(messages)} msgs -> {MOCK_MODEL}")
     resp = await client.messages.create(
         model=MOCK_MODEL,
         max_tokens=MAX_TOKENS,
-        system=MOCK_SYSTEM_PROMPT,
+        system=system,
         messages=messages,
     )
     return resp.content[0].text.strip()
 
 
-async def _relay_complete(messages: list[dict]) -> str:
+async def _relay_complete(
+    messages: list[dict],
+    system_prompt: Optional[str],
+) -> str:
     base_url = os.getenv("JARVIS_GATEWAY_URL", "http://127.0.0.1:18789").rstrip("/")
     token = os.getenv("JARVIS_GATEWAY_TOKEN", "")
     if not token:
@@ -94,11 +102,19 @@ async def _relay_complete(messages: list[dict]) -> str:
             "Set it in .env and restart the server."
         )
 
+    # OpenAI chat-completions format: system prompt is a leading message
+    # with role "system". OpenClaw may or may not honor it; if it does,
+    # we get the short-form voice tone; if not, we get whatever system
+    # prompt OpenClaw's own model config has baked in (still functional).
+    final_messages: list[dict] = list(messages)
+    if system_prompt:
+        final_messages = [{"role": "system", "content": system_prompt}, *final_messages]
+
     client = AsyncOpenAI(base_url=f"{base_url}/v1", api_key=token)
-    log.info(f"[gateway:relay] {len(messages)} msgs -> {RELAY_MODEL} @ {base_url}")
+    log.info(f"[gateway:relay] {len(final_messages)} msgs -> {RELAY_MODEL} @ {base_url}")
     resp = await client.chat.completions.create(
         model=RELAY_MODEL,
-        messages=messages,
+        messages=final_messages,
         max_tokens=MAX_TOKENS,
     )
     return (resp.choices[0].message.content or "").strip()
