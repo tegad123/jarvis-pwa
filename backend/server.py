@@ -24,13 +24,20 @@ from typing import Optional
 import httpx
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
+from pydantic import BaseModel
 
 from action_extractor import extract_actions, archive_summarize
+from chat_auth import (
+    clear_session_cookie,
+    is_authenticated,
+    issue_session_cookie,
+    verify_password,
+)
 from discord_poster import post_action_items_to_discord
 from elevenlabs_tts import synthesize_voice
 from jarvis_brain import answer_with_jarvis_context
@@ -108,6 +115,33 @@ CREATE TABLE IF NOT EXISTS talk_history (
 
 CREATE INDEX IF NOT EXISTS idx_memos_date ON voice_memos(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_actions_memo ON action_items(memo_id);
+
+-- ── Chat mode (Mode 4) ───────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS chats (
+    chat_id         TEXT PRIMARY KEY,
+    title           TEXT,
+    created_at      TEXT,
+    last_message_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    message_id  TEXT PRIMARY KEY,
+    chat_id     TEXT,
+    role        TEXT CHECK(role IN ('user','assistant')),
+    content     TEXT,
+    created_at  TEXT,
+    FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_map (
+    chat_id              TEXT PRIMARY KEY,
+    openclaw_session_id  TEXT NOT NULL,
+    created_at           TEXT,
+    FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chats_last_message_at ON chats(last_message_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
 """
 
 def db():
@@ -418,6 +452,33 @@ async def memo_detail(memo_id: int):
         "mood": memo["mood"],
         "actions": [dict(a) for a in actions],
     }
+
+# ──────────────────────────────────────────────────────────────────────────
+# MODE 4: CHAT — AUTH ENDPOINTS
+# ──────────────────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.post("/chat/api/login")
+async def chat_login(req: LoginRequest, response: Response):
+    if not verify_password(req.password):
+        raise HTTPException(401, "invalid password")
+    issue_session_cookie(response)
+    return {"ok": True}
+
+
+@app.post("/chat/api/logout")
+async def chat_logout(response: Response):
+    clear_session_cookie(response)
+    return {"ok": True}
+
+
+@app.get("/chat/api/auth-status")
+async def chat_auth_status(request: Request):
+    return {"authenticated": is_authenticated(request)}
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # STATIC FRONTEND
