@@ -214,8 +214,12 @@ jarvis-pwa/
 
 - **Wake word ("Hey Jarvis")** — not yet implemented in this v1. Spencer holds the button to talk, taps to record. Wake-word listening drains battery and is unreliable in PWAs on iOS. If he wants it later, the cleanest path is a native iOS shortcut that opens the PWA via URL scheme.
 - **Always-on recording** — see "deliberate divergence" above. Easy to add if needed.
-- **Multi-user** — currently single-user (Spencer). Adding Eddie/Blake/Martin requires auth, which is a known follow-up.
-- **Skill execution from talk mode** — Mode 1 acknowledges tasks but doesn't execute. The path for execution is: talk → Spencer says "log a task to…" → talk-mode replies "on it" → posts to Discord → main Jarvis processes. Currently the talk mode does the acknowledgment but doesn't post to Discord yet. Easy to wire in once the rest is tested.
+- **Multi-user** — currently single-user (Spencer). Adding Eddie/Blake/Martin requires per-user auth, which is a known follow-up.
+- **Skill execution from Talk mode now works** — Talk routes through the OpenClaw gateway with full skill access (`create_task`, `send_email`, etc.). Both the user transcript and the assistant reply are persisted into a Talk-originated chat thread (visible in the Chat tab, marked with a 🎙️ icon). New Talk session each time the user enters the Talk tab; cleared on tab-out.
+
+### Auth model
+
+- **Single password gate at the app shell, unlocks all modes.** Unauthenticated visitors see only a centered login card — no tabs, no top bar, no screens. After login, all 4 modes (Talk / Record / Memos / Chat) are accessible until logout or the 30-day session cookie expires. Cookie is `HttpOnly`, `SameSite=Lax`, path `/`.
 
 ### Chat mode (Mode 4)
 

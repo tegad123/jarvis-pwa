@@ -45,6 +45,17 @@ body {
   background-attachment: fixed;
 }
 
+/* ════════ SHELL AUTH STATES ════════
+   - .auth-pending: hide both shell-login and #app until status check resolves.
+   - .unauthenticated: show shell-login, hide #app.
+   - .authenticated: show #app, hide shell-login. */
+body.auth-pending #app,
+body.auth-pending .shell-login { visibility: hidden; }
+body.unauthenticated #app { display: none; }
+body.unauthenticated .shell-login { display: flex; }
+body.authenticated .shell-login { display: none; }
+.shell-login { display: none; }   /* default — JS upgrades to one of the above */
+
 button {
   font-family: inherit;
   border: none;
@@ -592,89 +603,15 @@ body.chat-mode .screen-chat.active { padding: 0; }
   padding: 24px 22px 12px;
 }
 
-/* ── Login view ── */
-.chat-login {
-  display: none;
-  flex: 1;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  padding: 0 22px;
-}
-.chat-login.visible { display: flex; }
-.chat-login-card {
-  width: 100%;
-  max-width: 320px;
-  padding: 28px 24px;
-  background: var(--bg-1);
-  border: 1px solid var(--line);
-  border-radius: 16px;
-}
-.chat-login-title {
-  font-family: var(--display);
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  color: var(--text);
-  margin-bottom: 6px;
-}
-.chat-login-sub {
-  font-size: 11px;
-  color: var(--text-mute);
-  letter-spacing: 0.05em;
-  margin-bottom: 18px;
-}
-.chat-login-form {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-#chatPasswordInput {
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 12px 14px;
-  color: var(--text);
-  font-family: var(--mono);
-  font-size: 14px;
-  outline: none;
-  -webkit-user-select: text;
-  user-select: text;
-}
-#chatPasswordInput:focus {
-  border-color: var(--accent);
-  background: var(--bg-2);
-}
-.chat-login-button {
-  padding: 12px 14px;
-  background: var(--accent);
-  color: #0a0a0a;
-  border-radius: 8px;
-  font-family: var(--mono);
-  font-weight: 500;
-  font-size: 12px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-.chat-login-button:active { transform: scale(0.98); }
-.chat-login-error {
-  margin-top: 12px;
-  font-size: 11px;
-  color: var(--red);
-  min-height: 14px;
-  letter-spacing: 0.03em;
-}
-
-/* ── App view (sidebar + main) ── */
+/* ── App view (sidebar + main) — always visible inside an active chat screen ── */
 .chat-app {
-  display: none;
+  display: flex;
   flex: 1;
   width: 100%;
   height: 100%;
   position: relative;
   overflow: hidden;
 }
-.chat-app.visible { display: flex; }
 
 /* Sidebar */
 .chat-sidebar {
@@ -918,4 +855,123 @@ body.chat-mode .screen-chat.active { padding: 0; }
   .chat-app.sidebar-open .chat-sidebar { transform: translateX(0); }
   .chat-app.sidebar-open .chat-sidebar-backdrop { display: block; }
   .chat-hamburger { display: flex; }
+}
+
+/* ════════════════════════════════════════════════════════════
+   SHELL LOGIN
+   ════════════════════════════════════════════════════════════ */
+.shell-login {
+  position: fixed;
+  inset: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background:
+    radial-gradient(ellipse 70% 50% at 50% 0%, rgba(201,242,92,0.05), transparent 70%),
+    var(--bg);
+}
+.shell-login-card {
+  width: 100%;
+  max-width: 340px;
+  padding: 32px 28px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+}
+.shell-login-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: 16px;
+  letter-spacing: 0.18em;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.shell-login-mark {
+  color: var(--accent);
+  font-size: 13px;
+  transform: translateY(-1px);
+  text-shadow: 0 0 8px var(--accent-glow);
+}
+.shell-login-sub {
+  font-size: 11px;
+  color: var(--text-mute);
+  letter-spacing: 0.05em;
+  margin-bottom: 22px;
+}
+.shell-login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+#shellPasswordInput {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  outline: none;
+  -webkit-user-select: text;
+  user-select: text;
+}
+#shellPasswordInput:focus {
+  border-color: var(--accent);
+  background: var(--bg-2);
+}
+.shell-login-button {
+  padding: 12px 14px;
+  background: var(--accent);
+  color: #0a0a0a;
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-weight: 500;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.shell-login-button:active { transform: scale(0.98); }
+.shell-login-error {
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--red);
+  min-height: 14px;
+  letter-spacing: 0.03em;
+}
+
+/* ════════════════════════════════════════════════════════════
+   TALK "SAVING TO" INDICATOR
+   ════════════════════════════════════════════════════════════ */
+.talk-saving-to {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -8px 0 12px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+  align-self: flex-start;
+}
+.talk-saving-to-icon { font-size: 11px; }
+.talk-saving-to-prefix { color: var(--text-mute); }
+.talk-saving-to-title {
+  color: var(--text-dim);
+  text-transform: none;
+  letter-spacing: 0.02em;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Sidebar talk-origin chats: emoji prefix lives in the title text node,
+   added by app.js. The CSS only needs to give a touch of color in case
+   the emoji renders as text on a font-deprived system. */
+.chat-list-item-title.is-talk::first-letter {
+  color: var(--accent);
 }

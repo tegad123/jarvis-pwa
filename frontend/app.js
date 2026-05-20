@@ -8,12 +8,14 @@ const API_BASE = '';   // same-origin (served by FastAPI)
 // STATE
 // ──────────────────────────────────────────────────────────────────────
 const state = {
-  mode: 'talk',                  // 'talk' | 'ambient' | 'archive'
+  mode: 'talk',                  // 'talk' | 'ambient' | 'archive' | 'chat'
+  authenticated: false,
   // Talk mode
   talkRecorder: null,
   talkStream: null,
   talkChunks: [],
   talkPressing: false,
+  talkChatId: null,              // minted per Talk session; cleared on tab-out
   // Ambient mode
   ambientRecorder: null,
   ambientStream: null,
@@ -31,6 +33,76 @@ const state = {
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
+// ══════════════════════════════════════════════════════════════════════
+// SHELL AUTH — gates the entire app shell. Until the auth check resolves,
+// neither the login card nor the tab nav is visible. After resolve, body
+// gets either .authenticated or .unauthenticated.
+// ══════════════════════════════════════════════════════════════════════
+const shellAuth = {
+  async init() {
+    document.body.classList.add('auth-pending');
+    try {
+      const r = await fetch('/chat/api/auth-status');
+      const data = await r.json();
+      state.authenticated = !!data.authenticated;
+    } catch {
+      state.authenticated = false;
+    }
+    this.applyAuthState();
+
+    $('#shellLoginForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      this.login();
+    });
+  },
+
+  applyAuthState() {
+    document.body.classList.remove('auth-pending', 'authenticated', 'unauthenticated');
+    document.body.classList.add(state.authenticated ? 'authenticated' : 'unauthenticated');
+    if (state.authenticated) {
+      // Spencer lands on Talk by default — mint a Talk session immediately
+      // so the "saving to:" indicator is meaningful from turn one.
+      talkSession.ensure();
+    } else {
+      setTimeout(() => $('#shellPasswordInput')?.focus(), 50);
+    }
+  },
+
+  async login() {
+    const password = $('#shellPasswordInput').value;
+    const errEl = $('#shellLoginError');
+    errEl.textContent = '';
+    try {
+      const r = await fetch('/chat/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      if (!r.ok) {
+        errEl.textContent = 'Wrong password — try again.';
+        $('#shellPasswordInput').select();
+        return;
+      }
+      $('#shellPasswordInput').value = '';
+      state.authenticated = true;
+      this.applyAuthState();
+    } catch {
+      errEl.textContent = 'Network error.';
+    }
+  },
+
+  async logout() {
+    try { await fetch('/chat/api/logout', { method: 'POST' }); } catch {}
+    state.authenticated = false;
+    state.talkChatId = null;
+    // Reset any chat-mode body class so the shell renders at default width.
+    document.body.classList.remove('chat-mode');
+    this.applyAuthState();
+  },
+};
+
+shellAuth.init();
+
 // ──────────────────────────────────────────────────────────────────────
 // MODE SWITCHING
 // ──────────────────────────────────────────────────────────────────────
@@ -43,6 +115,59 @@ function switchMode(mode) {
 
 $$('.tab').forEach(tab => {
   tab.addEventListener('click', () => switchMode(tab.dataset.mode));
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// TALK SESSION LIFECYCLE — every entry into Talk mode mints a fresh chat
+// thread (origin='talk'); every exit clears it. Defined as its own module
+// so the shell-auth + tab listeners can both call into it.
+// ══════════════════════════════════════════════════════════════════════
+const talkSession = {
+  async ensure() {
+    if (state.talkChatId) return state.talkChatId;
+    try {
+      const r = await fetch('/chat/api/talk-session/new', { method: 'POST' });
+      if (!r.ok) return null;
+      const data = await r.json();
+      state.talkChatId = data.chat_id;
+      this.updateIndicator(null);
+    } catch {
+      // Fine to fail — /api/talk will auto-mint on first request.
+    }
+    return state.talkChatId;
+  },
+
+  clear() {
+    state.talkChatId = null;
+    this.updateIndicator(null, /*reset=*/ true);
+  },
+
+  updateIndicator(title, reset = false) {
+    const el = $('#talkSavingToTitle');
+    if (!el) return;
+    if (reset || !state.talkChatId) {
+      el.textContent = 'new Talk session';
+    } else if (title) {
+      el.textContent = title;
+    } else {
+      el.textContent = 'new Talk session';
+    }
+  },
+};
+
+// Wire Talk-session lifecycle to tab clicks. Additive — doesn't replace
+// the existing tab→switchMode listener.
+$$('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    const mode = tab.dataset.mode;
+    if (mode === 'talk') {
+      // entering Talk → ensure we have a session
+      talkSession.ensure();
+    } else {
+      // leaving Talk → clear so next return mints a fresh one
+      if (state.talkChatId) talkSession.clear();
+    }
+  });
 });
 
 // ──────────────────────────────────────────────────────────────────────
@@ -128,13 +253,36 @@ async function handleTalkStop() {
   try {
     const form = new FormData();
     form.append('audio', blob, 'talk.webm');
+    if (state.talkChatId) form.append('chat_id', state.talkChatId);
     const r = await fetch(`${API_BASE}/api/talk`, { method: 'POST', body: form });
+    if (r.status === 401) {
+      // session expired mid-Talk — bounce back to the shell login
+      shellAuth.logout();
+      return;
+    }
     if (!r.ok) throw new Error(`server ${r.status}`);
+
+    // Server may have auto-minted a chat_id if we didn't pass one.
+    const returnedChatId = r.headers.get('X-Chat-Id');
+    if (returnedChatId && returnedChatId !== state.talkChatId) {
+      state.talkChatId = returnedChatId;
+    }
 
     const userText = decodeHeader(r.headers.get('X-User-Text'));
     const jarvisText = decodeHeader(r.headers.get('X-Jarvis-Text'));
     appendTalkTurn('you', userText);
     appendTalkTurn('jarvis', jarvisText);
+
+    // Refresh the "saving to:" indicator — backend may have auto-titled
+    // the chat from this turn's user transcript.
+    try {
+      const cr = await fetch('/chat/api/chats');
+      if (cr.ok) {
+        const chats = await cr.json();
+        const me = chats.find(c => c.chat_id === state.talkChatId);
+        if (me?.title) talkSession.updateIndicator(me.title);
+      }
+    } catch {}
 
     const audioBlob = await r.blob();
     const audioUrl = URL.createObjectURL(audioBlob);
@@ -503,25 +651,21 @@ document.addEventListener('gesturestart', e => e.preventDefault());
 
 // ══════════════════════════════════════════════════════════════════════
 // MODE 4 — CHAT
-// Self-contained namespace; does NOT touch Talk/Record/Memos handlers.
+// Auth lives at the shell level (shellAuth). This namespace assumes the
+// user is already authenticated when it activates.
 // ══════════════════════════════════════════════════════════════════════
 const chat = {
   state: {
-    authenticated: false,
     chats: [],
     currentChatId: null,
     sending: false,
-    activated: false,
+    loaded: false,
   },
   el: {},
 
   init() {
     this.el = {
-      login:           $('#chatLogin'),
       app:             $('#chatApp'),
-      loginForm:       $('#chatLoginForm'),
-      passwordInput:   $('#chatPasswordInput'),
-      loginError:      $('#chatLoginError'),
       newButton:       $('#chatNewButton'),
       list:            $('#chatList'),
       title:           $('#chatTitle'),
@@ -534,12 +678,8 @@ const chat = {
       logoutButton:    $('#chatLogoutButton'),
     };
 
-    this.el.loginForm.addEventListener('submit', (e) => {
-      e.preventDefault();
-      this.login();
-    });
     this.el.newButton.addEventListener('click', () => this.createChat());
-    this.el.logoutButton.addEventListener('click', () => this.logout());
+    this.el.logoutButton.addEventListener('click', () => shellAuth.logout());
     this.el.sendButton.addEventListener('click', () => this.sendMessage());
     this.el.input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -551,7 +691,6 @@ const chat = {
     this.el.hamburger.addEventListener('click', () => this.toggleSidebar());
     this.el.sidebarBackdrop.addEventListener('click', () => this.closeSidebar());
 
-    // iOS standalone keyboard handling: scroll the composer into view on focus
     this.el.input.addEventListener('focus', () => {
       setTimeout(() => {
         this.el.input.scrollIntoView({ block: 'end', behavior: 'smooth' });
@@ -561,20 +700,13 @@ const chat = {
 
   async onActivate() {
     document.body.classList.add('chat-mode');
-    if (this.state.activated) return;  // initial fetch already done this session
-    try {
-      const r = await fetch('/chat/api/auth-status');
-      const data = await r.json();
-      this.state.authenticated = !!data.authenticated;
-    } catch {
-      this.state.authenticated = false;
-    }
-    this.state.activated = true;
-    if (this.state.authenticated) {
-      this.showApp();
+    if (!state.authenticated) return;
+    if (!this.state.loaded) {
       await this.loadChats();
+      this.state.loaded = true;
     } else {
-      this.showLogin();
+      // Refresh — picks up any chats minted by Talk mode meanwhile.
+      this.loadChats();
     }
   },
 
@@ -582,54 +714,10 @@ const chat = {
     document.body.classList.remove('chat-mode');
   },
 
-  showLogin() {
-    this.el.login.classList.add('visible');
-    this.el.app.classList.remove('visible');
-    setTimeout(() => this.el.passwordInput.focus(), 100);
-  },
-
-  showApp() {
-    this.el.login.classList.remove('visible');
-    this.el.app.classList.add('visible');
-  },
-
-  async login() {
-    const password = this.el.passwordInput.value;
-    this.el.loginError.textContent = '';
-    try {
-      const r = await fetch('/chat/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
-      });
-      if (!r.ok) {
-        this.el.loginError.textContent = 'Wrong password — try again.';
-        this.el.passwordInput.select();
-        return;
-      }
-      this.state.authenticated = true;
-      this.el.passwordInput.value = '';
-      this.showApp();
-      await this.loadChats();
-    } catch {
-      this.el.loginError.textContent = 'Network error.';
-    }
-  },
-
-  async logout() {
-    try { await fetch('/chat/api/logout', { method: 'POST' }); } catch {}
-    this.state.authenticated = false;
-    this.state.currentChatId = null;
-    this.state.chats = [];
-    this.el.messages.innerHTML = '<div class="chat-empty">Pick a chat or start a new one.</div>';
-    this.el.title.textContent = 'No chat selected';
-    this.showLogin();
-  },
-
   async loadChats() {
     try {
       const r = await fetch('/chat/api/chats');
-      if (r.status === 401) { this.state.authenticated = false; this.showLogin(); return; }
+      if (r.status === 401) { shellAuth.logout(); return; }
       if (!r.ok) return;
       this.state.chats = await r.json();
       this.renderChatList();
@@ -646,11 +734,18 @@ const chat = {
       const div = document.createElement('div');
       div.className = 'chat-list-item';
       if (c.chat_id === this.state.currentChatId) div.classList.add('active');
-      const titleClass = c.title ? '' : 'empty';
+      const isTalk = c.origin === 'talk';
+      const titleEmpty = !c.title;
       const titleText = c.title || 'New chat';
+      const titleClasses = [
+        'chat-list-item-title',
+        titleEmpty ? 'empty' : '',
+        isTalk ? 'is-talk' : '',
+      ].filter(Boolean).join(' ');
+      const prefix = isTalk ? '🎙️ ' : '';
       const ts = c.last_message_at || c.created_at;
       div.innerHTML = `
-        <div class="chat-list-item-title ${titleClass}">${escapeHtml(titleText)}</div>
+        <div class="${titleClasses}">${prefix}${escapeHtml(titleText)}</div>
         <div class="chat-list-item-time">${this.relativeTime(ts)}</div>
       `;
       div.addEventListener('click', () => this.openChat(c.chat_id));

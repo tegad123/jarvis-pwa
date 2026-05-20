@@ -15,7 +15,32 @@
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
-<body>
+<body class="auth-pending">
+
+  <!-- ════════ SHELL LOGIN — gates the entire app ════════
+       Visible only when body.unauthenticated. Hides the whole
+       tab nav + screens until the user authenticates. -->
+  <div class="shell-login" id="shellLogin">
+    <div class="shell-login-card">
+      <div class="shell-login-brand">
+        <span class="shell-login-mark">▲</span>
+        <span class="shell-login-name">JARVIS</span>
+      </div>
+      <div class="shell-login-sub">Sign in to continue.</div>
+      <form class="shell-login-form" id="shellLoginForm">
+        <input
+          type="password"
+          id="shellPasswordInput"
+          placeholder="password"
+          autocomplete="current-password"
+          inputmode="numeric"
+        />
+        <button type="submit" class="shell-login-button">Sign in</button>
+      </form>
+      <div class="shell-login-error" id="shellLoginError"></div>
+    </div>
+  </div>
+
   <div id="app">
 
     <header class="top-bar">
@@ -54,6 +79,12 @@
         <div class="screen-meta">
           <span class="meta-label">mode</span>
           <span class="meta-value">two-way · voice</span>
+        </div>
+
+        <div class="talk-saving-to" id="talkSavingTo">
+          <span class="talk-saving-to-icon">🎙️</span>
+          <span class="talk-saving-to-prefix">saving to:</span>
+          <span class="talk-saving-to-title" id="talkSavingToTitle">new Talk session</span>
         </div>
 
         <div class="orb-stage">
@@ -125,26 +156,6 @@
 
       <!-- ───── MODE 4: CHAT ───── -->
       <section class="screen screen-chat" data-screen="chat">
-        <!-- Logged-out view -->
-        <div class="chat-login" id="chatLogin">
-          <div class="chat-login-card">
-            <div class="chat-login-title">Sign in</div>
-            <div class="chat-login-sub">Chat with Jarvis. Single password gate.</div>
-            <form class="chat-login-form" id="chatLoginForm">
-              <input
-                type="password"
-                id="chatPasswordInput"
-                placeholder="password"
-                autocomplete="current-password"
-                inputmode="numeric"
-              />
-              <button type="submit" class="chat-login-button">Sign in</button>
-            </form>
-            <div class="chat-login-error" id="chatLoginError"></div>
-          </div>
-        </div>
-
-        <!-- Logged-in view -->
         <div class="chat-app" id="chatApp">
           <aside class="chat-sidebar" id="chatSidebar">
             <div class="chat-sidebar-header">
