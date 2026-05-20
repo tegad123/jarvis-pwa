@@ -16,6 +16,7 @@ import logging
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Optional
 import httpx
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -36,10 +37,12 @@ from chat_auth import (
     clear_session_cookie,
     is_authenticated,
     issue_session_cookie,
+    require_auth,
     verify_password,
 )
 from discord_poster import post_action_items_to_discord
 from elevenlabs_tts import synthesize_voice
+import gateway_client
 from jarvis_brain import answer_with_jarvis_context
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -478,6 +481,143 @@ async def chat_logout(response: Response):
 @app.get("/chat/api/auth-status")
 async def chat_auth_status(request: Request):
     return {"authenticated": is_authenticated(request)}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# MODE 4: CHAT — CRUD ENDPOINTS
+# ──────────────────────────────────────────────────────────────────────────
+
+class MessageRequest(BaseModel):
+    content: str
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _make_title(text: str, limit: int = 40) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+@app.get("/chat/api/chats", dependencies=[Depends(require_auth)])
+async def chat_list_chats():
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT chat_id, title, created_at, last_message_at
+               FROM chats
+               ORDER BY COALESCE(last_message_at, created_at) DESC"""
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/chat/api/chats", dependencies=[Depends(require_auth)])
+async def chat_create_chat():
+    chat_id = uuid.uuid4().hex
+    now = _now_iso()
+    openclaw_session_id = f"pwa:chat:{chat_id}"
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO chats (chat_id, title, created_at, last_message_at) "
+            "VALUES (?, NULL, ?, NULL)",
+            (chat_id, now),
+        )
+        conn.execute(
+            "INSERT INTO session_map (chat_id, openclaw_session_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (chat_id, openclaw_session_id, now),
+        )
+    return {"chat_id": chat_id, "title": None}
+
+
+@app.get("/chat/api/chats/{chat_id}/messages", dependencies=[Depends(require_auth)])
+async def chat_get_messages(chat_id: str):
+    with db() as conn:
+        chat = conn.execute(
+            "SELECT 1 FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if not chat:
+            raise HTTPException(404, "chat not found")
+        rows = conn.execute(
+            """SELECT message_id, role, content, created_at
+               FROM messages
+               WHERE chat_id = ?
+               ORDER BY created_at ASC, message_id ASC""",
+            (chat_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/chat/api/chats/{chat_id}/message", dependencies=[Depends(require_auth)])
+async def chat_send_message(chat_id: str, req: MessageRequest):
+    content = (req.content or "").strip()
+    if not content:
+        raise HTTPException(400, "content required")
+
+    with db() as conn:
+        chat_row = conn.execute(
+            "SELECT title FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if not chat_row:
+            raise HTTPException(404, "chat not found")
+
+        user_msg_id = uuid.uuid4().hex
+        user_now = _now_iso()
+        conn.execute(
+            "INSERT INTO messages (message_id, chat_id, role, content, created_at) "
+            "VALUES (?, ?, 'user', ?, ?)",
+            (user_msg_id, chat_id, content, user_now),
+        )
+        if chat_row["title"] is None:
+            conn.execute(
+                "UPDATE chats SET title = ?, last_message_at = ? WHERE chat_id = ?",
+                (_make_title(content), user_now, chat_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE chats SET last_message_at = ? WHERE chat_id = ?",
+                (user_now, chat_id),
+            )
+
+        history_rows = conn.execute(
+            """SELECT role, content FROM messages
+               WHERE chat_id = ?
+               ORDER BY created_at ASC, message_id ASC""",
+            (chat_id,),
+        ).fetchall()
+
+    history = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+
+    try:
+        reply_text = await gateway_client.complete(
+            history, anthropic_client=anthropic_client
+        )
+    except Exception:
+        log.exception(f"[CHAT {chat_id}] gateway call failed")
+        raise HTTPException(502, "gateway error")
+
+    assistant_msg_id = uuid.uuid4().hex
+    assistant_now = _now_iso()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO messages (message_id, chat_id, role, content, created_at) "
+            "VALUES (?, ?, 'assistant', ?, ?)",
+            (assistant_msg_id, chat_id, reply_text, assistant_now),
+        )
+        conn.execute(
+            "UPDATE chats SET last_message_at = ? WHERE chat_id = ?",
+            (assistant_now, chat_id),
+        )
+
+    return {
+        "message_id": assistant_msg_id,
+        "chat_id": chat_id,
+        "role": "assistant",
+        "content": reply_text,
+        "created_at": assistant_now,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────
