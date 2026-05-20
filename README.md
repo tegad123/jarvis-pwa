@@ -219,8 +219,10 @@ jarvis-pwa/
 
 ### Chat mode (Mode 4)
 
-- **No login rate limiting.** The `/chat/api/login` endpoint accepts unlimited attempts. This is acceptable for a single-user PWA behind a Cloudflare tunnel, but should be revisited before any wider exposure (multi-user, public deploy). See `backend/chat_auth.py` TODO.
+- **No login rate limiting.** The `/chat/api/login` endpoint accepts unlimited attempts and the password is a single 5-digit numeric code. Acceptable for a single-user PWA behind a Cloudflare tunnel; **must** be revisited before any wider exposure (multi-user, public deploy, longer-lived deploy). See `backend/chat_auth.py` TODO.
+- **Markdown is rendered as plain text.** Claude's `**bold**` and `- bullet` syntax shows up literally in the bubble — asterisks and dashes are not converted. Intentional in v1 (no markdown dependency); upgrade to `marked` or similar when needed.
+- **No image upload.** The composer accepts text only. Adding image support means a multipart endpoint, Claude vision wiring on the gateway side, and image-attachment rendering in bubbles.
 - **No streaming responses.** Chat waits for the full Claude/gateway reply before rendering. Streaming can be added later via Server-Sent Events on `/chat/api/chats/{id}/message`.
-- **Markdown is rendered as plain text.** Claude's `**bold**` / `- bullet` syntax shows literally in the bubble. Intentional in v1 (no markdown lib dependency); upgrade to `marked` or similar when needed.
-- **Relay-mode session continuity** — `session_map` is populated but the openclaw_session_id is not yet passed through to the gateway request. Each chat creates a fresh OpenClaw session per call until that wire-up is added (see `backend/gateway_client.py` docstring).
-- **PWA service worker may cache stale chat assets.** If you ship a Chat-mode update and don't see it on your phone, hard-refresh once or bump `sw.js` cache version.
+- **Voice input lives in Talk mode, not Chat mode.** Chat is typed-only. If Spencer wants to speak into Chat, use Talk (Mode 1) — Chat mode is the persistent, multi-thread surface.
+- **Relay-mode session continuity not yet wired.** `session_map` is populated (every PWA chat gets a unique `openclaw_session_id` = `pwa:chat:{chat_id}`), but the id is **not** passed through to the gateway request yet. Every chat creates a fresh OpenClaw session on the gateway side. Full continuity is a follow-up patch — see `backend/gateway_client.py` docstring.
+- **PWA service worker may cache stale chat assets.** If you ship a Chat-mode update and don't see it on your phone, hard-refresh once or bump the cache version in `sw.js`.
