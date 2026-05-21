@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PUBLIC_URL="${PUBLIC_URL:-https://app.34jarvis.uk}"
+LOCAL_HEALTH_URL="${LOCAL_HEALTH_URL:-http://localhost:8765/api/health}"
 SERVICE_LABEL="${SERVICE_LABEL:-com.34dev.jarvis-pwa}"
 PUSH=1
 RESTART=1
@@ -62,11 +63,43 @@ else
 fi
 
 if [[ "$VERIFY" -eq 1 ]]; then
+  echo "Waiting for local health at ${LOCAL_HEALTH_URL}"
+  LOCAL_OK=0
+  for attempt in {1..15}; do
+    if curl -fsS "$LOCAL_HEALTH_URL" >/dev/null 2>&1; then
+      echo "Local health check passed on attempt ${attempt}."
+      LOCAL_OK=1
+      break
+    fi
+    if [[ "$attempt" -lt 15 ]]; then
+      echo "Local health not ready yet (attempt ${attempt}/15); retrying in 2s..."
+      sleep 2
+    fi
+  done
+  if [[ "$LOCAL_OK" -ne 1 ]]; then
+    echo "Deploy verification failed: local backend did not pass health within 30s." >&2
+    echo "Checked URL: ${LOCAL_HEALTH_URL}" >&2
+    echo "Check launchd status and logs under data/server.log / data/server.err.log." >&2
+    exit 1
+  fi
+
   ASSET_URL="${PUBLIC_URL%/}/styles.css?v=${ASSET_VERSION}"
   echo "Verifying fresh CSS at ${ASSET_URL}"
-  if ! curl -fsSL "$ASSET_URL" | grep -q "asset-version: ${ASSET_VERSION}"; then
-    echo "Deploy verification failed: live CSS does not contain asset-version: ${ASSET_VERSION}." >&2
-    echo "Likely culprit: Cloudflare or a browser/PWA service-worker cache serving stale CSS." >&2
+  PUBLIC_OK=0
+  for attempt in {1..3}; do
+    if curl -fsSL "$ASSET_URL" | grep -q "asset-version: ${ASSET_VERSION}"; then
+      echo "Public freshness check passed on attempt ${attempt}."
+      PUBLIC_OK=1
+      break
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      echo "Public freshness check failed (attempt ${attempt}/3); retrying in 5s..."
+      sleep 5
+    fi
+  done
+  if [[ "$PUBLIC_OK" -ne 1 ]]; then
+    echo "Deploy verification failed: public CSS does not contain asset-version: ${ASSET_VERSION} after 3 attempts." >&2
+    echo "Likely culprit: Cloudflare reconnect lag or stale Cloudflare cache." >&2
     echo "Checked URL: ${ASSET_URL}" >&2
     exit 1
   fi
