@@ -48,7 +48,7 @@ body.auth-pending #app,
 body.auth-pending .shell-login { visibility: hidden; }
 body.unauthenticated #app { display: none; }
 body.unauthenticated .shell-login { display: flex; }
-body.authenticated .shell-login { display: none; }
+body.authenticated .shell-login { display: none !important; }
 .shell-login { display: none; }
 
 button {
@@ -70,6 +70,7 @@ button {
   padding-top: var(--safe-top);
   padding-bottom: var(--safe-bottom);
   position: relative;
+  z-index: 1;
 }
 
 /* ════════ TOP BAR ════════ */
@@ -474,9 +475,13 @@ button {
 .shell-login {
   position: fixed;
   inset: 0;
+  z-index: 1000;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding-top: max(24px, env(safe-area-inset-top));
+  padding-bottom: max(24px, env(safe-area-inset-bottom));
+  padding-left: 24px;
+  padding-right: 24px;
   background:
     radial-gradient(ellipse 70% 50% at 50% 0%, rgba(201,242,92,0.05), transparent 70%),
     var(--bg);
