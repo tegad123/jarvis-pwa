@@ -212,7 +212,7 @@ jarvis-pwa/
 
 ## Known limits & next steps
 
-- **Wake word ("Hey Jarvis")** — not yet implemented in this v1. Spencer holds the button to talk, taps to record. Wake-word listening drains battery and is unreliable in PWAs on iOS. If he wants it later, the cleanest path is a native iOS shortcut that opens the PWA via URL scheme.
+- **Wake word ("Hey Jarvis")** — not yet implemented in this v1. Spencer taps the composer mic to start/stop a voice turn. Wake-word listening drains battery and is unreliable in PWAs on iOS. If he wants it later, the cleanest path is a native iOS shortcut that opens the PWA via URL scheme.
 - **Always-on recording** — see "deliberate divergence" above. Easy to add if needed.
 - **Multi-user** — currently single-user (Spencer). Adding Eddie/Blake/Martin requires per-user auth, which is a known follow-up.
 - **Skill execution from Talk mode now works** — Talk routes through the OpenClaw gateway with full skill access (`create_task`, `send_email`, etc.). Both the user transcript and the assistant reply are persisted into a Talk-originated chat thread (visible in the Chat tab, marked with a 🎙️ icon). New Talk session each time the user enters the Talk tab; cleared on tab-out.
@@ -227,7 +227,8 @@ jarvis-pwa/
 - **Markdown is rendered as plain text.** Claude's `**bold**` and `- bullet` syntax shows up literally in the bubble — asterisks and dashes are not converted. Intentional in v1 (no markdown dependency); upgrade to `marked` or similar when needed.
 - **No image upload.** The composer accepts text only. Adding image support means a multipart endpoint, Claude vision wiring on the gateway side, and image-attachment rendering in bubbles.
 - **No streaming responses.** Chat waits for the full Claude/gateway reply before rendering. Streaming can be added later via Server-Sent Events on `/chat/api/chats/{id}/message`.
-- **Voice input lives in Talk mode, not Chat mode.** Chat is typed-only. If Spencer wants to speak into Chat, use Talk (Mode 1) — Chat mode is the persistent, multi-thread surface.
+- **Voice input lives in the Chat composer.** Tap the mic once to start recording, tap again to stop and send. This tap-to-toggle behavior is intentional for iPhone standalone PWA use; it is more reliable than press-and-hold after Safari's microphone permission prompt.
+- **Assistant voice playback is one-shot.** TTS plays automatically once when a fresh assistant voice reply arrives in the currently visible chat. Message history remains text-only: no replay buttons and no voice markers on bubbles. Server-side `has_audio` / `audio_url` metadata and cached files remain for analytics and future tooling.
 - **No audio cache TTL.** Voice message audio files accumulate in `data/audio_cache/`. Single-user usage at expected volume means ~100MB max per year. Sweep manually or add a TTL job if volume grows.
 - **Relay-mode session continuity not yet wired.** `session_map` is populated (every PWA chat gets a unique `openclaw_session_id` = `pwa:chat:{chat_id}`), but the id is **not** passed through to the gateway request yet. Every chat creates a fresh OpenClaw session on the gateway side. Full continuity is a follow-up patch — see `backend/gateway_client.py` docstring.
 - **PWA service worker may cache stale chat assets.** If you ship a Chat-mode update and don't see it on your phone, hard-refresh once or bump the cache version in `sw.js`.

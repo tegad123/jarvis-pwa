@@ -65,6 +65,20 @@
               <span></span><span></span><span></span>
             </button>
             <div class="chat-title" id="chatTitle">No chat selected</div>
+            <button class="chat-settings-button" id="chatSettingsButton" aria-label="Chat settings" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"></path>
+                <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.04 1.56V21a2 2 0 1 1-4 0v-.08A1.7 1.7 0 0 0 8.96 19.36a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.04H3a2 2 0 1 1 0-4h.04A1.7 1.7 0 0 0 4.6 8.96a1.7 1.7 0 0 0-.34-1.87l-.06-.06A2 2 0 1 1 7.03 4.2l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.04a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c0 .67.39 1.28 1 1.56H21a2 2 0 1 1 0 4h-.04A1.7 1.7 0 0 0 19.4 15Z"></path>
+              </svg>
+            </button>
+            <div class="chat-settings-panel" id="chatSettingsPanel" hidden>
+              <label class="chat-setting-label" for="voiceSpeedSlider">
+                <span>Voice playback speed</span>
+                <output id="voiceSpeedValue">1.0x</output>
+              </label>
+              <input id="voiceSpeedSlider" class="chat-speed-slider" type="range" min="0.75" max="2" step="0.05" value="1" />
+              <button class="chat-settings-logout" id="chatSettingsLogoutButton">log out</button>
+            </div>
           </div>
 
           <div class="chat-messages" id="chatMessages">
@@ -80,7 +94,7 @@
               autocorrect="off"
               spellcheck="false"
             ></textarea>
-            <button class="chat-mic-button" id="chatMicButton" aria-label="Hold to record">
+            <button class="chat-mic-button" id="chatMicButton" aria-label="Tap to record">
               <svg class="chat-mic-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"></path>
                 <path d="M5 11a7 7 0 0 0 14 0"></path>
