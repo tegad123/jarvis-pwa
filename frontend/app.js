@@ -257,7 +257,31 @@ const chat = {
     const div = document.createElement('div');
     div.className = `chat-bubble chat-bubble-${m.role}`;
     if (m.pending) div.classList.add('chat-bubble-pending');
-    div.textContent = m.content;
+    if (m.has_audio && m.audio_url) div.classList.add('chat-bubble-with-audio');
+    if (m.has_audio && m.audio_url) {
+      const icon = document.createElement('span');
+      icon.className = 'chat-bubble-mic-icon';
+      icon.textContent = '🎙️';
+      div.appendChild(icon);
+    }
+
+    const text = document.createElement('span');
+    text.className = 'chat-bubble-text';
+    text.textContent = m.content;
+    div.appendChild(text);
+
+    if (m.has_audio && m.audio_url) {
+      const replay = document.createElement('button');
+      replay.className = 'chat-bubble-replay';
+      replay.setAttribute('aria-label', 'Replay audio');
+      replay.textContent = '▶';
+      replay.addEventListener('click', () => {
+        const audio = new Audio(m.audio_url);
+        audio.play().catch(() => {});
+      });
+      div.appendChild(replay);
+    }
+
     this.el.messages.appendChild(div);
     this.scrollToBottom();
     return div;
@@ -299,14 +323,14 @@ const chat = {
       if (!r.ok) throw new Error(`server ${r.status}`);
       const reply = await r.json();
       pendingEl.classList.remove('chat-bubble-pending');
-      pendingEl.textContent = reply.content;
+      pendingEl.querySelector('.chat-bubble-text').textContent = reply.content;
       this.scrollToBottom();
       await this.loadChats();
       const updated = this.state.chats.find(c => c.chat_id === chatId);
       if (updated?.title) this.el.title.textContent = updated.title;
     } catch {
       pendingEl.classList.remove('chat-bubble-pending');
-      pendingEl.textContent = '(error — please try again)';
+      pendingEl.querySelector('.chat-bubble-text').textContent = '(error — please try again)';
     } finally {
       this.state.sending = false;
       this.el.sendButton.disabled = false;

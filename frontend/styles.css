@@ -290,6 +290,32 @@ button {
   opacity: 0.55;
   font-style: italic;
 }
+.chat-bubble-with-audio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-bubble-text {
+  min-width: 0;
+}
+.chat-bubble-mic-icon {
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.chat-bubble-replay {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 100px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.chat-bubble-replay:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
 
 .chat-composer {
   display: flex;
