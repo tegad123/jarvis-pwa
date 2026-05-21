@@ -1,8 +1,8 @@
 // Minimal service worker — just enough to make the PWA installable.
 // We don't aggressively cache anything: the audio backend is dynamic.
 
-const CACHE = 'jarvis-a80b615';
-const SHELL = ['/', '/index.html', '/styles.css?v=a80b615', '/app.js?v=a80b615', '/manifest.json?v=a80b615'];
+const CACHE = 'jarvis-52a2a17';
+const SHELL = ['/', '/index.html', '/styles.css?v=52a2a17', '/app.js?v=52a2a17', '/manifest.json?v=52a2a17'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
