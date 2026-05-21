@@ -24,22 +24,54 @@ on the same Mini at `127.0.0.1:18789`.
 
 ## 1 — Pull latest from main
 
+Use the deploy script for normal deploys. It pulls `main`, stamps
+frontend asset URLs with the app commit SHA being deployed, commits and
+pushes that stamp, restarts launchd, and verifies the live CSS is fresh.
+
 ```bash
 ssh nemoclaw@nemo-mac-mini.<tailnet>.ts.net    # or via Tailscale Magic DNS
 cd ~/jarvis-pwa
-git fetch origin
-git checkout main
-git pull origin main
+./scripts/deploy.sh
 ```
 
-Verify the latest commit looks right:
+Do **not** use the old shortcut (`git pull && launchctl kickstart`) for
+frontend deploys. Cloudflare can cache `/styles.css` and `/app.js`
+long enough to produce a mixed deploy: fresh HTML/JS with stale CSS.
+The deploy script prevents that by cache-busting asset URLs.
+
+Verify the latest commits look right:
 
 ```bash
 git log --oneline -5
 ```
 
-You should see `Chat mode (Mode 4) — frontend chat tab` at the top
-(or whatever the latest deploy commit is).
+You should see the app commit you intended to deploy plus, when the
+asset stamp changed, a deploy commit like:
+
+```
+Deploy: cache-bust assets for <sha>
+```
+
+### What `scripts/deploy.sh` does
+
+1. Refuses to run if tracked files are dirty.
+2. Fetches and fast-forwards `main`.
+3. Reads the current app commit SHA. If `HEAD` is already a
+   `Deploy: cache-bust assets for <sha>` commit, it reuses that recorded
+   SHA so repeated deploys are idempotent.
+4. Runs `scripts/cache-bust.sh <sha>` to update:
+   - `frontend/index.html` asset URLs (`/styles.css?v=<sha>`,
+     `/app.js?v=<sha>`, `/manifest.json?v=<sha>`)
+   - `frontend/styles.css` `asset-version: <sha>` proof comment
+   - `frontend/sw.js` cache name and shell asset URLs
+5. Commits and pushes the asset stamp if it changed.
+6. Restarts `com.34dev.jarvis-pwa` with `launchctl kickstart`.
+7. Verifies `https://app.34jarvis.uk/styles.css?v=<sha>` contains
+   `asset-version: <sha>`.
+
+The verification uses the versioned CSS URL because the app itself uses
+that URL. A stale bare `/styles.css` object in Cloudflare is harmless
+once `index.html` points at `/styles.css?v=<sha>`.
 
 ---
 
@@ -82,6 +114,9 @@ which you'll need to paste in by hand).
 
 ## 3 — Restart the PWA backend
 
+The deploy script already restarts the backend. Use this manual command
+only for emergency restarts that do not change frontend assets:
+
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.34dev.jarvis-pwa
 ```
@@ -109,7 +144,32 @@ mode doesn't need them.
 
 ## 4 — Smoke tests (from the Mini or from your laptop)
 
-### 4a. Health + unauthenticated chat status
+### 4a. Cache-bust verification
+
+The deploy script performs this automatically. To run it by hand, replace
+`<sha>` with the asset version printed by the deploy script:
+
+```bash
+curl -fsSL "https://app.34jarvis.uk/styles.css?v=<sha>" | grep "asset-version: <sha>"
+```
+
+If this fails, the likely culprit is Cloudflare or a browser/PWA
+service-worker cache serving stale CSS. Re-run `./scripts/deploy.sh` and
+confirm the versioned URL in `frontend/index.html` changed.
+
+Static deploy-sensitive assets (`/index.html`, `/styles.css`,
+`/app.js`, `/manifest.json`, `/sw.js`) are served with:
+
+```
+Cache-Control: no-cache, must-revalidate
+```
+
+This is intentionally conservative. The app is small, and avoiding stale
+frontend deploys matters more than shaving a few milliseconds from CSS/JS
+loads. Versioned URLs still let browsers and Cloudflare store assets, but
+they must revalidate when the same URL is requested again.
+
+### 4b. Health + unauthenticated chat status
 
 ```bash
 curl https://app.34jarvis.uk/api/health
@@ -119,7 +179,7 @@ curl https://app.34jarvis.uk/chat/api/auth-status
 # → {"authenticated":false}
 ```
 
-### 4b. Login
+### 4c. Login
 
 ```bash
 curl -i -X POST https://app.34jarvis.uk/chat/api/login \
@@ -142,7 +202,7 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST \
 # → 401
 ```
 
-### 4c. End-to-end: create chat → send message → confirm relay path hit
+### 4d. End-to-end: create chat → send message → confirm relay path hit
 
 ```bash
 # Create
@@ -185,11 +245,11 @@ curl -i http://127.0.0.1:18789/v1/chat/completions \
 A working gateway returns `200` with a chat completion JSON. `401`
 means token mismatch; connection refused means the gateway isn't up.
 
-### 4d. PWA on phone
+### 4e. PWA on phone
 
 1. Open `https://app.34jarvis.uk` on Spencer's phone.
-2. Tap "04 Chat" → password screen.
-3. Enter `34811` → chat UI.
+2. Enter `34811` → chat UI.
+3. Confirm the composer shows textarea + mic + SEND.
 4. "+ New Chat" → type a message → Jarvis (real one, via the
    gateway) responds.
 

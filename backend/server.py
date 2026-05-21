@@ -81,6 +81,27 @@ logging.basicConfig(
 )
 log = logging.getLogger("jarvis-pwa")
 
+NO_CACHE_STATIC_PATHS = {
+    "/",
+    "/index.html",
+    "/styles.css",
+    "/app.js",
+    "/manifest.json",
+    "/sw.js",
+}
+
+
+class JarvisStaticFiles(StaticFiles):
+    """Static frontend with revalidation headers for deploy-sensitive assets."""
+
+    def file_response(self, full_path, stat_result, scope, status_code: int = 200) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        if scope.get("path") in NO_CACHE_STATIC_PATHS:
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
 # ──────────────────────────────────────────────────────────────────────────
 # DATABASE
 # ──────────────────────────────────────────────────────────────────────────
@@ -567,7 +588,7 @@ async def chat_audio(filename: str):
 # ──────────────────────────────────────────────────────────────────────────
 
 if FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+    app.mount("/", JarvisStaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
 
 if __name__ == "__main__":
