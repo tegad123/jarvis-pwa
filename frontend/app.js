@@ -86,6 +86,7 @@ const chat = {
       pending: 0,
       startedAt: 0,
       statusTimer: null,
+      emptyCount: 0,
     },
     audio: {
       current: null,
@@ -351,6 +352,12 @@ const chat = {
   },
 
   async handleMicTap(e) {
+    this.logMicState('tap', {
+      recorderState: this.state.mic.recorder?.state || 'none',
+      pending: this.state.mic.pending,
+      hasStream: !!this.state.mic.stream,
+      tracks: this.describeMicTracks(this.state.mic.stream),
+    });
     if (this.isRecording()) {
       this.stopRecording();
       return;
@@ -360,17 +367,22 @@ const chat = {
       await this.startRecording(e);
     } catch (err) {
       console.error(err);
+      this.releaseMicStream('start-failed');
       this.micIdle();
       this.showMicStatus('mic unavailable');
     }
   },
 
   async ensureMicStream() {
-    if (this.state.mic.stream) return this.state.mic.stream;
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error('microphone unsupported');
     }
+    this.releaseMicStream('before-new-stream');
+    this.logMicState('requesting-stream');
     this.state.mic.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    this.logMicState('stream-ready', {
+      tracks: this.describeMicTracks(this.state.mic.stream),
+    });
     return this.state.mic.stream;
   },
 
@@ -388,29 +400,81 @@ const chat = {
     this.el.micButton.setPointerCapture?.(e.pointerId);
 
     recorder.ondataavailable = (e) => {
+      this.logMicState('dataavailable', {
+        size: e.data?.size || 0,
+        type: e.data?.type || '',
+        recorderState: recorder.state,
+        chunks: this.state.mic.chunks.length,
+        tracks: this.describeMicTracks(stream),
+      });
       if (e.data?.size) this.state.mic.chunks.push(e.data);
     };
-    recorder.onstop = () => this.handleMicStop(recorder, Date.now() - this.state.mic.startedAt);
-    recorder.start();
+    recorder.onerror = (event) => {
+      this.logMicState('recorder-error', {
+        error: event.error?.message || event.error?.name || 'unknown',
+        recorderState: recorder.state,
+        tracks: this.describeMicTracks(stream),
+      });
+    };
+    recorder.onstart = () => {
+      this.logMicState('recording-started', {
+        mimeType: recorder.mimeType,
+        recorderState: recorder.state,
+        tracks: this.describeMicTracks(stream),
+      });
+    };
+    recorder.onstop = () => {
+      const durationMs = Date.now() - this.state.mic.startedAt;
+      this.logMicState('recorder-stop-event', {
+        durationMs,
+        mimeType: recorder.mimeType,
+        recorderState: recorder.state,
+        chunks: this.state.mic.chunks.length,
+        tracks: this.describeMicTracks(stream),
+      });
+      this.handleMicStop(recorder, durationMs);
+    };
     this.state.mic.recorder = recorder;
+    recorder.start();
     this.el.micButton.classList.add('recording');
     this.el.micButton.classList.remove('processing');
     this.el.micButton.setAttribute('aria-label', 'Tap to stop recording');
     this.el.sendButton.disabled = true;
     this.showListening();
+    this.logMicTransition('idle', 'recording', {
+      mimeType: recorder.mimeType,
+      tracks: this.describeMicTracks(stream),
+    });
   },
 
   stopRecording() {
     const recorder = this.state.mic.recorder;
     this.state.mic.pressing = false;
+    this.logMicState('stop-requested', {
+      recorderState: recorder?.state || 'none',
+      tracks: this.describeMicTracks(this.state.mic.stream),
+    });
     if (recorder?.state === 'recording') {
       recorder.stop();
+      return;
+    }
+    if (recorder) {
+      this.logMicState('stop-ignored', { reason: `recorder-${recorder.state}` });
     }
   },
 
   async handleMicStop(recorder, durationMs) {
     const chunks = this.state.mic.chunks;
     const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+    const tracks = this.describeMicTracks(this.state.mic.stream);
+    this.logMicState('recording-stopped', {
+      durationMs,
+      blobSize: blob.size,
+      mimeType: blob.type,
+      chunks: chunks.length,
+      tracks,
+    });
+    this.releaseMicStream('recording-stop');
     this.state.mic.chunks = [];
     this.state.mic.recorder = null;
     this.el.micButton.classList.remove('recording');
@@ -418,14 +482,33 @@ const chat = {
     this.playQueuedAudio();
 
     if (durationMs < 1000 || blob.size < 1000) {
+      const reason = durationMs < 1000 ? 'too-short' : 'empty-blob';
+      this.state.mic.emptyCount += 1;
+      this.logMicTransition('recording', 'idle', {
+        discard: true,
+        reason,
+        durationMs,
+        blobSize: blob.size,
+        emptyCount: this.state.mic.emptyCount,
+      });
+      const msg = this.state.mic.emptyCount > 1
+        ? 'Recording was empty again — try again'
+        : 'Recording was empty — try again';
       this.micIdle();
+      this.showMicStatus(msg);
       return;
     }
+    this.state.mic.emptyCount = 0;
 
     this.state.mic.sending = true;
     this.state.mic.pending = (this.state.mic.pending || 0) + 1;
     this.setMicProcessing();
     this.el.sendButton.disabled = true;
+    this.logMicTransition('recording', 'processing', {
+      durationMs,
+      blobSize: blob.size,
+      mimeType: blob.type,
+    });
 
     if (!this.state.currentChatId) {
       await this.createChat();
@@ -440,6 +523,12 @@ const chat = {
     try {
       const form = new FormData();
       form.append('audio', blob, 'voice.webm');
+      this.logMicState('upload-start', {
+        chatId,
+        durationMs,
+        blobSize: blob.size,
+        mimeType: blob.type,
+      });
       const r = await fetch(`/chat/api/chats/${chatId}/voice-message`, {
         method: 'POST',
         body: form,
@@ -448,6 +537,10 @@ const chat = {
       if (!r.ok) throw new Error(`server ${r.status}`);
 
       const data = await r.json();
+      this.logMicState('upload-success', {
+        chatId,
+        hasAssistantAudio: !!data.assistant_message?.audio_url,
+      });
       let assistantEl = null;
       if (this.state.currentChatId === chatId) {
         this.appendMessage(data.user_message);
@@ -467,6 +560,10 @@ const chat = {
       if (updated?.title && this.state.currentChatId === chatId) this.el.title.textContent = updated.title;
     } catch (err) {
       console.error(err);
+      this.logMicState('upload-failed', {
+        chatId,
+        error: err.message || String(err),
+      });
       this.showMicStatus('voice failed');
     } finally {
       this.state.mic.pending = Math.max(0, (this.state.mic.pending || 1) - 1);
@@ -475,6 +572,7 @@ const chat = {
   },
 
   micIdle() {
+    const wasProcessing = this.state.mic.sending;
     this.state.mic.pressing = false;
     this.state.mic.sending = (this.state.mic.pending || 0) > 0;
     if (!this.isRecording()) this.el.micButton.classList.remove('recording');
@@ -482,6 +580,11 @@ const chat = {
     this.el.micButton.disabled = false;
     this.el.micButton.setAttribute('aria-label', this.isRecording() ? 'Tap to stop recording' : 'Tap to record');
     this.el.sendButton.disabled = this.state.sending || this.isRecording();
+    if (wasProcessing && !this.state.mic.sending && !this.isRecording()) {
+      this.logMicTransition('processing', 'idle', {
+        pending: this.state.mic.pending,
+      });
+    }
   },
 
   isRecording() {
@@ -496,12 +599,47 @@ const chat = {
     this.el.micButton.classList.remove('processing');
   },
 
+  releaseMicStream(reason) {
+    const stream = this.state.mic.stream;
+    if (!stream) return;
+    const before = this.describeMicTracks(stream);
+    stream.getTracks().forEach(track => {
+      try { track.stop(); } catch {}
+    });
+    this.state.mic.stream = null;
+    this.logMicState('stream-released', { reason, tracks: before });
+  },
+
+  describeMicTracks(stream) {
+    if (!stream) return [];
+    return stream.getTracks().map(track => ({
+      kind: track.kind,
+      enabled: track.enabled,
+      muted: track.muted,
+      readyState: track.readyState,
+      label: track.label || '',
+    }));
+  },
+
+  logMicState(event, detail = {}) {
+    console.log('[mic-state]', event, {
+      ...detail,
+      recorderState: detail.recorderState || this.state.mic.recorder?.state || 'none',
+      pending: this.state.mic.pending,
+      sending: this.state.mic.sending,
+      isRecording: this.isRecording(),
+    });
+  },
+
+  logMicTransition(from, to, detail = {}) {
+    this.logMicState(`${from} -> ${to}`, detail);
+  },
+
   stopMicStream() {
     if (this.state.mic.recorder?.state === 'recording') {
       this.state.mic.recorder.stop();
     }
-    this.state.mic.stream?.getTracks().forEach(track => track.stop());
-    this.state.mic.stream = null;
+    this.releaseMicStream('stop-mic-stream');
     this.state.mic.recorder = null;
     this.state.mic.chunks = [];
     this.state.mic.pending = 0;
