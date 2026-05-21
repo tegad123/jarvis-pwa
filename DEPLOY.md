@@ -66,8 +66,20 @@ Deploy: cache-bust assets for <sha>
    - `frontend/sw.js` cache name and shell asset URLs
 5. Commits and pushes the asset stamp if it changed.
 6. Restarts `com.34dev.jarvis-pwa` with `launchctl kickstart`.
-7. Verifies `https://app.34jarvis.uk/styles.css?v=<sha>` contains
-   `asset-version: <sha>`.
+7. Waits for `http://localhost:8765/api/health` every 2 seconds for up
+   to 30 seconds.
+8. Verifies the public Cloudflare path in three tiers:
+   - `https://app.34jarvis.uk/styles.css?v=<sha>` contains
+     `asset-version: <sha>`
+   - `https://app.34jarvis.uk/` returns 200 and references
+     `/styles.css?v=<sha>`, `/app.js?v=<sha>`, and
+     `/manifest.json?v=<sha>`
+   - `https://app.34jarvis.uk/chat/api/auth-status` returns 200 with
+     valid JSON
+
+The public verification retries 3 times with a 5-second backoff after
+local health is confirmed. This avoids false deploy failures during the
+5-10 second backend boot window or Cloudflare reconnect lag.
 
 The verification uses the versioned CSS URL because the app itself uses
 that URL. A stale bare `/styles.css` object in Cloudflare is harmless
@@ -144,18 +156,22 @@ mode doesn't need them.
 
 ## 4 — Smoke tests (from the Mini or from your laptop)
 
-### 4a. Cache-bust verification
+### 4a. Timing-aware deploy verification
 
 The deploy script performs this automatically. To run it by hand, replace
 `<sha>` with the asset version printed by the deploy script:
 
 ```bash
+curl -fsS "http://localhost:8765/api/health"
 curl -fsSL "https://app.34jarvis.uk/styles.css?v=<sha>" | grep "asset-version: <sha>"
+curl -fsSL "https://app.34jarvis.uk/" | grep "styles.css?v=<sha>"
+curl -fsSL "https://app.34jarvis.uk/chat/api/auth-status" | python3 -m json.tool
 ```
 
-If this fails, the likely culprit is Cloudflare or a browser/PWA
-service-worker cache serving stale CSS. Re-run `./scripts/deploy.sh` and
-confirm the versioned URL in `frontend/index.html` changed.
+If local health fails for more than 30 seconds, check launchd and
+`data/server.err.log`. If local health passes but public checks fail,
+the likely culprit is Cloudflare reconnect lag, stale Cloudflare cache,
+or a dead tunnel.
 
 Static deploy-sensitive assets (`/index.html`, `/styles.css`,
 `/app.js`, `/manifest.json`, `/sw.js`) are served with:
@@ -255,7 +271,166 @@ means token mismatch; connection refused means the gateway isn't up.
 
 ---
 
-## 5 — Rollback
+## 5 — Observability
+
+Run the one-command diagnostic any time something feels off:
+
+```bash
+cd ~/jarvis-pwa
+./scripts/status.sh
+```
+
+It checks:
+
+- PWA backend on port `8765`
+- OpenClaw gateway on port `18789`
+- cloudflared tunnel process and recent connection logs
+- public `app.34jarvis.uk` and `jarvis.34jarvis.uk`
+- disk space
+- latest deployed commit
+- recent error lines
+- PWA and cloudflared launchd recovery settings
+
+Exit code is `1` if any line is red. Each failing line includes a
+remediation hint.
+
+### Health watchdogs
+
+The repo includes three health scripts:
+
+```bash
+./scripts/jarvis-pwa-health.sh      # local backend health; restarts PWA after 3 consecutive failures
+./scripts/cloudflared-health.sh     # public tunnel health; restarts cloudflared after 3 consecutive failures
+./scripts/health-check.sh           # runs both checks once
+```
+
+Recommended cron entries on the Mini:
+
+```cron
+* * * * * cd /Users/nemoclaw/jarvis-pwa && ./scripts/cloudflared-health.sh >> data/health-cron.log 2>&1
+*/2 * * * * cd /Users/nemoclaw/jarvis-pwa && ./scripts/health-check.sh >> data/health-cron.log 2>&1
+```
+
+Install them with:
+
+```bash
+./scripts/install-health-cron.sh
+```
+
+The cloudflared restart command uses sudo:
+
+```bash
+sudo launchctl kickstart -k system/com.cloudflare.cloudflared
+```
+
+If cron runs without a TTY, configure passwordless sudo for that exact
+launchctl command or run `scripts/cloudflared-health.sh --loop` from a
+root-owned launchd job instead.
+
+### Launchd hardening
+
+The current PWA plist is expected at:
+
+```bash
+~/Library/LaunchAgents/com.34dev.jarvis-pwa.plist
+```
+
+Target recovery settings:
+
+```text
+KeepAlive=true
+RunAtLoad=true
+ThrottleInterval=5
+StandardOutPath=/Users/nemoclaw/jarvis-pwa/data/server.log
+StandardErrorPath=/Users/nemoclaw/jarvis-pwa/data/server.err.log
+```
+
+The current cloudflared plist is expected at:
+
+```bash
+/Library/LaunchDaemons/com.cloudflare.cloudflared.plist
+```
+
+Target recovery settings:
+
+```text
+KeepAlive=true
+RunAtLoad=true
+ThrottleInterval=10
+StandardOutPath=/var/log/cloudflared.log
+StandardErrorPath=/var/log/cloudflared.err.log
+```
+
+To apply those settings:
+
+```bash
+./scripts/harden-launchd-plists.sh
+```
+
+That script validates both plists but does not reload services
+automatically. Reload during a maintenance window.
+
+### Manual restart fallbacks
+
+```bash
+# PWA backend
+launchctl kickstart -k gui/$(id -u)/com.34dev.jarvis-pwa
+
+# Cloudflare tunnel
+sudo launchctl kickstart -k system/com.cloudflare.cloudflared
+
+# OpenClaw gateway
+# Use the OpenClaw service command/runbook for the Mini.
+```
+
+---
+
+## 6 — Troubleshooting
+
+### Deploy verification fails
+
+1. Wait 30 seconds and retry `./scripts/deploy.sh`.
+2. Run `./scripts/status.sh`.
+3. If local health is red, inspect:
+   ```bash
+   tail -120 ~/jarvis-pwa/data/server.err.log
+   ```
+4. If public URL is red but local health is green, restart cloudflared:
+   ```bash
+   sudo launchctl kickstart -k system/com.cloudflare.cloudflared
+   ```
+
+### Public URL returns 502/530
+
+Run:
+
+```bash
+./scripts/status.sh
+```
+
+If backend is green and public URL is red, cloudflared or Cloudflare edge
+connectivity is the likely problem.
+
+### Backend crashed
+
+launchd should auto-restart it. If it does not:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.34dev.jarvis-pwa
+tail -120 ~/jarvis-pwa/data/server.err.log
+```
+
+### Mini rebooted
+
+Expected: PWA and cloudflared come back automatically via launchd. If not:
+
+```bash
+./scripts/status.sh
+```
+
+---
+
+## 7 — Rollback
 
 If the new release breaks something, roll back to the previous commit:
 
@@ -275,7 +450,7 @@ affect Talk/Record/Memos. No DB migration to reverse.
 
 ---
 
-## 6 — What to deploy next
+## 8 — What to deploy next
 
 When the gateway integration is confirmed end-to-end, follow up by
 wiring the OpenClaw session id from `session_map` into the relay
