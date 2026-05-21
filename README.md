@@ -228,5 +228,6 @@ jarvis-pwa/
 - **No image upload.** The composer accepts text only. Adding image support means a multipart endpoint, Claude vision wiring on the gateway side, and image-attachment rendering in bubbles.
 - **No streaming responses.** Chat waits for the full Claude/gateway reply before rendering. Streaming can be added later via Server-Sent Events on `/chat/api/chats/{id}/message`.
 - **Voice input lives in Talk mode, not Chat mode.** Chat is typed-only. If Spencer wants to speak into Chat, use Talk (Mode 1) — Chat mode is the persistent, multi-thread surface.
+- **No audio cache TTL.** Voice message audio files accumulate in `data/audio_cache/`. Single-user usage at expected volume means ~100MB max per year. Sweep manually or add a TTL job if volume grows.
 - **Relay-mode session continuity not yet wired.** `session_map` is populated (every PWA chat gets a unique `openclaw_session_id` = `pwa:chat:{chat_id}`), but the id is **not** passed through to the gateway request yet. Every chat creates a fresh OpenClaw session on the gateway side. Full continuity is a follow-up patch — see `backend/gateway_client.py` docstring.
 - **PWA service worker may cache stale chat assets.** If you ship a Chat-mode update and don't see it on your phone, hard-refresh once or bump the cache version in `sw.js`.

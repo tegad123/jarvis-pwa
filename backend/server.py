@@ -86,9 +86,8 @@ log = logging.getLogger("jarvis-pwa")
 # ──────────────────────────────────────────────────────────────────────────
 #
 # Three tables that matter post-refactor: chats, messages, session_map.
-# voice_memos / action_items / talk_history still exist on disk in
-# pre-refactor installs — they're left in place by this commit and
-# dropped in the next.
+# Pre-refactor installs may still have voice_memos / action_items /
+# talk_history on disk; init_db drops those legacy tables idempotently.
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chats (
@@ -152,6 +151,14 @@ def init_db():
         if "audio_url" not in msg_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN audio_url TEXT")
             log.info("Migration: added messages.audio_url column")
+
+        for table in ("voice_memos", "action_items", "talk_history"):
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone():
+                conn.execute(f"DROP TABLE {table}")
+                log.info(f"Migration: dropped legacy table {table}")
 
     log.info(f"Database ready at {DB_PATH}")
 
