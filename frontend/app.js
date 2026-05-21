@@ -76,6 +76,15 @@ const chat = {
     currentChatId: null,
     sending: false,
     loaded: false,
+    mic: {
+      stream: null,
+      recorder: null,
+      chunks: [],
+      pressing: false,
+      sending: false,
+      startedAt: 0,
+      statusTimer: null,
+    },
   },
   el: {},
 
@@ -88,6 +97,8 @@ const chat = {
       messages:        $('#chatMessages'),
       input:           $('#chatInput'),
       sendButton:      $('#chatSendButton'),
+      micButton:       $('#chatMicButton'),
+      micStatus:       $('#chatMicStatus'),
       hamburger:       $('#chatHamburger'),
       sidebar:         $('#chatSidebar'),
       sidebarBackdrop: $('#chatSidebarBackdrop'),
@@ -97,6 +108,21 @@ const chat = {
     this.el.newButton.addEventListener('click', () => this.createChat());
     this.el.logoutButton.addEventListener('click', () => shellAuth.logout());
     this.el.sendButton.addEventListener('click', () => this.sendMessage());
+    this.el.micButton.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      this.startRecording(e).catch((err) => {
+        console.error(err);
+        this.micIdle();
+        this.showMicStatus('mic unavailable');
+      });
+    });
+    const endPress = (e) => {
+      e.preventDefault();
+      if (this.state.mic.pressing) this.stopRecording();
+    };
+    this.el.micButton.addEventListener('pointerup', endPress);
+    this.el.micButton.addEventListener('pointerleave', endPress);
+    this.el.micButton.addEventListener('pointercancel', endPress);
     this.el.input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -129,6 +155,7 @@ const chat = {
     this.state.currentChatId = null;
     this.state.sending = false;
     this.state.loaded = false;
+    this.stopMicStream();
     if (!this.el.messages) return;
     this.el.list.innerHTML = '';
     this.el.title.textContent = 'No chat selected';
@@ -241,7 +268,7 @@ const chat = {
   },
 
   async sendMessage() {
-    if (this.state.sending) return;
+    if (this.state.sending || this.state.mic.sending) return;
     const content = this.el.input.value.trim();
     if (!content) return;
     if (!this.state.currentChatId) {
@@ -286,6 +313,131 @@ const chat = {
     }
   },
 
+  async ensureMicStream() {
+    if (this.state.mic.stream) return this.state.mic.stream;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('microphone unsupported');
+    }
+    this.state.mic.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    return this.state.mic.stream;
+  },
+
+  async startRecording(e) {
+    if (this.state.sending || this.state.mic.sending || this.state.mic.recorder?.state === 'recording') return;
+    if (!window.MediaRecorder) throw new Error('MediaRecorder unsupported');
+    const stream = await this.ensureMicStream();
+    const mimeType = pickMime();
+    const options = mimeType ? { mimeType } : undefined;
+    const recorder = new MediaRecorder(stream, options);
+
+    this.state.mic.chunks = [];
+    this.state.mic.startedAt = Date.now();
+    this.state.mic.pressing = true;
+    this.el.micButton.setPointerCapture?.(e.pointerId);
+
+    recorder.ondataavailable = (e) => {
+      if (e.data?.size) this.state.mic.chunks.push(e.data);
+    };
+    recorder.onstop = () => this.handleMicStop(recorder, Date.now() - this.state.mic.startedAt);
+    recorder.start();
+    this.state.mic.recorder = recorder;
+    this.el.micButton.classList.add('recording');
+    this.el.micButton.classList.remove('processing');
+    this.clearMicStatus();
+  },
+
+  stopRecording() {
+    const recorder = this.state.mic.recorder;
+    this.state.mic.pressing = false;
+    if (recorder?.state === 'recording') {
+      recorder.stop();
+    }
+  },
+
+  async handleMicStop(recorder, durationMs) {
+    const chunks = this.state.mic.chunks;
+    const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+    this.state.mic.chunks = [];
+    this.state.mic.recorder = null;
+    this.el.micButton.classList.remove('recording');
+
+    if (durationMs < 1000 || blob.size < 1000) {
+      this.micIdle();
+      return;
+    }
+
+    this.state.mic.sending = true;
+    this.el.micButton.classList.add('processing');
+    this.el.micButton.disabled = true;
+    this.el.sendButton.disabled = true;
+
+    if (!this.state.currentChatId) {
+      await this.createChat();
+      if (!this.state.currentChatId) {
+        this.micIdle();
+        return;
+      }
+    }
+
+    const chatId = this.state.currentChatId;
+    try {
+      const form = new FormData();
+      form.append('audio', blob, 'voice.webm');
+      const r = await fetch(`/chat/api/chats/${chatId}/voice-message`, {
+        method: 'POST',
+        body: form,
+      });
+      if (r.status === 401) { shellAuth.logout(); return; }
+      if (!r.ok) throw new Error(`server ${r.status}`);
+
+      const data = await r.json();
+      this.appendMessage(data.user_message);
+      this.appendMessage(data.assistant_message);
+      if (data.assistant_message?.audio_url) {
+        const audio = new Audio(data.assistant_message.audio_url);
+        audio.play().catch(() => {});
+      }
+      await this.loadChats();
+      const updated = this.state.chats.find(c => c.chat_id === chatId);
+      if (updated?.title) this.el.title.textContent = updated.title;
+    } catch (err) {
+      console.error(err);
+      this.showMicStatus('voice failed');
+    } finally {
+      this.micIdle();
+    }
+  },
+
+  micIdle() {
+    this.state.mic.sending = false;
+    this.state.mic.pressing = false;
+    this.el.micButton.classList.remove('recording', 'processing');
+    this.el.micButton.disabled = false;
+    this.el.sendButton.disabled = this.state.sending;
+  },
+
+  stopMicStream() {
+    if (this.state.mic.recorder?.state === 'recording') {
+      this.state.mic.recorder.stop();
+    }
+    this.state.mic.stream?.getTracks().forEach(track => track.stop());
+    this.state.mic.stream = null;
+    this.state.mic.recorder = null;
+    this.state.mic.chunks = [];
+    this.micIdle();
+  },
+
+  showMicStatus(text) {
+    clearTimeout(this.state.mic.statusTimer);
+    this.el.micStatus.textContent = text;
+    this.state.mic.statusTimer = setTimeout(() => this.clearMicStatus(), 1800);
+  },
+
+  clearMicStatus() {
+    clearTimeout(this.state.mic.statusTimer);
+    this.el.micStatus.textContent = '';
+  },
+
   autoResize() {
     const el = this.el.input;
     el.style.height = 'auto';
@@ -314,6 +466,14 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
+}
+
+function pickMime() {
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
+  for (const c of candidates) {
+    if (MediaRecorder.isTypeSupported(c)) return c;
+  }
+  return '';
 }
 
 document.addEventListener('gesturestart', e => e.preventDefault());

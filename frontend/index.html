@@ -80,7 +80,20 @@
               autocorrect="off"
               spellcheck="false"
             ></textarea>
+            <button class="chat-mic-button" id="chatMicButton" aria-label="Hold to record">
+              <svg class="chat-mic-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"></path>
+                <path d="M5 11a7 7 0 0 0 14 0"></path>
+                <path d="M12 18v3"></path>
+                <path d="M8 21h8"></path>
+              </svg>
+              <span class="chat-mic-waveform" aria-hidden="true">
+                <span></span><span></span><span></span>
+              </span>
+              <span class="chat-mic-spinner" aria-hidden="true"></span>
+            </button>
             <button class="chat-send-button" id="chatSendButton">send</button>
+            <div class="chat-mic-status" id="chatMicStatus" aria-live="polite"></div>
           </div>
         </div>
 
