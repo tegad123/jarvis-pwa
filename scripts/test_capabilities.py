@@ -44,9 +44,11 @@ DEFAULT_GOOGLE_TOKEN = Path(
         str(Path.home() / ".openclaw" / "workspace" / "credentials" / "google_token.json"),
     )
 )
-DEFAULT_CALENDAR_ID = os.getenv("JARVIS_CALENDAR_ID", "spencerhuck@34dev.com")
+DEFAULT_CALENDAR_ID = os.getenv("JARVIS_CALENDAR_ID", "tega@34dev.com")
+DEFAULT_AUDIT_SENDER = os.getenv("JARVIS_AUDIT_SENDER", "tega@34dev.com")
+SPENCER_CALENDAR_ID = os.getenv("JARVIS_SPENCER_CALENDAR_ID", "spencerhuck@34dev.com")
 DEFAULT_LOG_PATH = Path(os.getenv("JARVIS_SERVER_ERR_LOG", str(ROOT / "data" / "server.err.log")))
-SAFE_EMAILS = {"test-recipient@34dev.com", "test-attendee@34dev.com"}
+SAFE_EMAILS = {"tega@34dev.com"}
 BRIDGE_GRACEFUL_ERROR = "Sorry, I had trouble with that. Could you try again?"
 
 
@@ -64,6 +66,8 @@ class HarnessConfig:
     per_test_timeout: float
     total_budget: float
     token_budget_usd: float
+    audit_sender: str
+    only: set[str] = field(default_factory=set)
     dry_run: bool = False
 
 
@@ -82,11 +86,21 @@ class TestResult:
 
 
 class PwaClient:
-    def __init__(self, base_url: str, password: str, timeout: float) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        password: str,
+        timeout: float,
+        *,
+        audit_sender: str,
+        calendar_id: str,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.password = password
         self.timeout = timeout
         self.cookie = ""
+        self.audit_sender = audit_sender
+        self.calendar_id = calendar_id
 
     def request(
         self,
@@ -97,7 +111,11 @@ class PwaClient:
         timeout: float | None = None,
     ) -> tuple[int, dict[str, Any], dict[str, str]]:
         data = None
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "X-PWA-Audit-Sender": self.audit_sender,
+            "X-PWA-Audit-Calendar-Id": self.calendar_id,
+        }
         if payload is not None:
             data = json.dumps(payload).encode()
             headers["Content-Type"] = "application/json"
@@ -182,8 +200,12 @@ def found_unsafe_email(text: str) -> str | None:
 def build_prompt(raw_message: str, prefix: str) -> str:
     return (
         f"{prefix} {raw_message.strip()}\n\n"
-        f"For this automated audit, include the exact marker {prefix} in any "
-        "task title, calendar event title, email subject, or other artifact you create."
+        "For this automated audit, act only on behalf of Tega "
+        "(tega@34dev.com), not Spencer. Use Tega as the requester, task owner, "
+        "calendar owner, and only allowed email/calendar recipient. Do not create "
+        "anything on Spencer's calendar or assign anything to Spencer. "
+        f"Include the exact marker {prefix} in any task title, calendar event "
+        "title, email subject, or other artifact you create."
     )
 
 
@@ -211,6 +233,21 @@ def task_rows_for_prefix(db_path: Path, prefix: str) -> list[str]:
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(
             "SELECT task_id FROM tasks WHERE task_summary LIKE ? OR full_context LIKE ?",
+            (f"%{prefix}%", f"%{prefix}%"),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def spencer_task_rows_for_prefix(db_path: Path, prefix: str) -> list[str]:
+    if not db_path.exists():
+        return []
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT task_id FROM tasks
+            WHERE (task_summary LIKE ? OR full_context LIKE ?)
+              AND (lower(assignee) LIKE '%spencer%' OR lower(assignee_name) LIKE '%spencer%')
+            """,
             (f"%{prefix}%", f"%{prefix}%"),
         ).fetchall()
     return [r[0] for r in rows]
@@ -317,6 +354,32 @@ def delete_calendar_events(cfg: HarnessConfig, token: str, events: list[dict[str
             if exc.code != 410:
                 raise
     return deleted
+
+
+def calendar_events_for_calendar(
+    *,
+    token: str,
+    calendar_id: str,
+    prefix: str,
+    within_hours: int = 168,
+) -> list[dict[str, Any]]:
+    time_min = datetime.now(timezone.utc) - timedelta(hours=1)
+    time_max = datetime.now(timezone.utc) + timedelta(hours=within_hours)
+    params = {
+        "timeMin": time_min.isoformat().replace("+00:00", "Z"),
+        "timeMax": time_max.isoformat().replace("+00:00", "Z"),
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "q": prefix,
+    }
+    url = (
+        "https://www.googleapis.com/calendar/v3/calendars/"
+        f"{urllib.parse.quote(calendar_id)}/events?{urllib.parse.urlencode(params)}"
+    )
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        items = json.loads(resp.read().decode()).get("items", [])
+    return [event for event in items if prefix.lower() in json.dumps(event).lower()]
 
 
 def read_log_since(path: Path, offset: int) -> str:
@@ -439,19 +502,38 @@ def run(cfg: HarnessConfig) -> dict[str, Any]:
     started = time.monotonic()
     cases = load_json(cfg.cases_path)
     tests = enforce_guardrails(cases.get("tests", []), prefix)
-    client = PwaClient(cfg.pwa_url, cfg.password, cfg.per_test_timeout)
     results: list[TestResult] = []
     chat_id: str | None = None
     google_token: str | None = None
     calendar_artifacts: list[dict[str, Any]] = []
     cleanup: dict[str, Any] = {"calendar_deleted": 0, "tasks_completed": 0, "chat_deleted": False}
+    isolation: dict[str, Any] = {
+        "spencer_calendar_events": [],
+        "spencer_task_ids": [],
+        "ok": True,
+    }
 
     try:
+        if cfg.audit_sender.lower() != "tega@34dev.com" or cfg.calendar_id.lower() != "tega@34dev.com":
+            raise RuntimeError(
+                "audit harness must run as Tega only: "
+                f"audit_sender={cfg.audit_sender!r} calendar_id={cfg.calendar_id!r}"
+            )
         if not cfg.dry_run:
+            client = PwaClient(
+                cfg.pwa_url,
+                cfg.password,
+                cfg.per_test_timeout,
+                audit_sender=cfg.audit_sender,
+                calendar_id=cfg.calendar_id,
+            )
             client.login()
             chat_id = client.create_chat()
             if cfg.google_token.exists():
                 google_token = get_google_access_token(cfg.google_token)
+
+        if cfg.only:
+            tests = [test for test in tests if test.get("id") in cfg.only]
 
         for idx, test in enumerate(tests, 1):
             if time.monotonic() - started > cfg.total_budget:
@@ -534,6 +616,38 @@ def run(cfg: HarnessConfig) -> dict[str, Any]:
     finally:
         if google_token:
             try:
+                isolation["spencer_calendar_events"] = [
+                    {
+                        "id": e.get("id"),
+                        "summary": e.get("summary"),
+                        "start": e.get("start"),
+                    }
+                    for e in calendar_events_for_calendar(
+                        token=google_token,
+                        calendar_id=SPENCER_CALENDAR_ID,
+                        prefix=prefix,
+                    )
+                ]
+            except Exception as exc:  # noqa: BLE001
+                isolation["spencer_calendar_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            isolation["spencer_task_ids"] = spencer_task_rows_for_prefix(cfg.tasks_db, prefix)
+        except Exception as exc:  # noqa: BLE001
+            isolation["spencer_task_error"] = f"{type(exc).__name__}: {exc}"
+        isolation["ok"] = not isolation["spencer_calendar_events"] and not isolation["spencer_task_ids"]
+        if not isolation["ok"]:
+            results.append(
+                TestResult(
+                    id="IDENTITY-ISOLATION",
+                    category="infrastructure",
+                    status="failed",
+                    message=prefix,
+                    errors=["test artifact landed on Spencer identity"],
+                    checks=[isolation],
+                )
+            )
+        if google_token:
+            try:
                 all_test_events = calendar_events(cfg, token=google_token, prefix=prefix, within_hours=168)
                 by_id = {event.get("id"): event for event in calendar_artifacts + all_test_events if event.get("id")}
                 cleanup["calendar_deleted"] = delete_calendar_events(cfg, google_token, list(by_id.values()))
@@ -568,6 +682,7 @@ def run(cfg: HarnessConfig) -> dict[str, Any]:
             "token_budget_usd": cfg.token_budget_usd,
         },
         "cleanup": cleanup,
+        "identity_isolation": isolation,
         "results": [r.__dict__ for r in results],
     }
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -587,6 +702,8 @@ def parse_args() -> HarnessConfig:
     parser.add_argument("--tasks-db", type=Path, default=DEFAULT_TASKS_DB)
     parser.add_argument("--google-token", type=Path, default=DEFAULT_GOOGLE_TOKEN)
     parser.add_argument("--calendar-id", default=DEFAULT_CALENDAR_ID)
+    parser.add_argument("--audit-sender", default=DEFAULT_AUDIT_SENDER)
+    parser.add_argument("--only", action="append", default=[])
     parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
     parser.add_argument("--per-test-timeout", type=float, default=60.0)
     parser.add_argument("--total-budget", type=float, default=30 * 60.0)
@@ -606,6 +723,8 @@ def parse_args() -> HarnessConfig:
         per_test_timeout=args.per_test_timeout,
         total_budget=args.total_budget,
         token_budget_usd=args.token_budget_usd,
+        audit_sender=args.audit_sender,
+        only=set(args.only),
         dry_run=args.dry_run,
     )
 

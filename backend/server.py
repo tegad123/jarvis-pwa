@@ -290,6 +290,8 @@ def _call_universal_bridge(
     user_content: str,
     channel: str,
     openclaw_session_id: str,
+    sender: str,
+    calendar_id: Optional[str] = None,
 ) -> str:
     if not BRIDGE_SCRIPT.is_file():
         raise RuntimeError(f"bridge script not found: {BRIDGE_SCRIPT}")
@@ -297,8 +299,10 @@ def _call_universal_bridge(
     context = {
         "session_id": openclaw_session_id,
         "chat_id": chat_id,
-        "sender": BRIDGE_SENDER,
+        "sender": sender,
     }
+    if calendar_id:
+        context["calendar_id"] = calendar_id
     cmd = [
         BRIDGE_PYTHON,
         str(BRIDGE_SCRIPT),
@@ -339,10 +343,20 @@ def _call_universal_bridge(
     return response_text
 
 
+def _audit_bridge_context(request: Request) -> tuple[str, Optional[str]]:
+    sender = (request.headers.get("x-pwa-audit-sender") or "").strip().lower()
+    calendar_id = (request.headers.get("x-pwa-audit-calendar-id") or "").strip().lower()
+    if sender == "tega@34dev.com":
+        return sender, calendar_id or sender
+    return BRIDGE_SENDER, None
+
+
 async def _exchange_turn(
     chat_id: str,
     user_content: str,
     channel: str,
+    sender: str = BRIDGE_SENDER,
+    calendar_id: Optional[str] = None,
 ) -> tuple[str, str, str, str]:
     """
     Append one user → assistant turn to an existing chat.
@@ -393,6 +407,8 @@ async def _exchange_turn(
             user_content=user_content,
             channel=channel,
             openclaw_session_id=openclaw_session_id,
+            sender=sender,
+            calendar_id=calendar_id,
         )
     except subprocess.TimeoutExpired:
         log.exception(
@@ -630,16 +646,19 @@ async def chat_get_messages(chat_id: str):
 
 
 @app.post("/chat/api/chats/{chat_id}/message", dependencies=[Depends(require_auth)])
-async def chat_send_message(chat_id: str, req: MessageRequest):
+async def chat_send_message(chat_id: str, req: MessageRequest, request: Request):
     """Text turn. No audio attachments produced."""
     content = (req.content or "").strip()
     if not content:
         raise HTTPException(400, "content required")
 
+    sender, calendar_id = _audit_bridge_context(request)
     _, assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
         chat_id=chat_id,
         user_content=content,
         channel="pwa-chat",
+        sender=sender,
+        calendar_id=calendar_id,
     )
     return {
         "message_id": assistant_msg_id,
@@ -654,6 +673,7 @@ async def chat_send_message(chat_id: str, req: MessageRequest):
 
 @app.post("/chat/api/chats/{chat_id}/voice-message", dependencies=[Depends(require_auth)])
 async def chat_voice_message(
+    request: Request,
     chat_id: str,
     audio: UploadFile = File(...),
 ):
@@ -694,10 +714,13 @@ async def chat_voice_message(
     user_audio_url = f"/chat/api/audio/{user_audio_name}"
 
     # Persist user → universal bridge → assistant.
+    sender, calendar_id = _audit_bridge_context(request)
     user_msg_id, assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
         chat_id=chat_id,
         user_content=transcript,
         channel="pwa-voice",
+        sender=sender,
+        calendar_id=calendar_id,
     )
     _set_message_audio(user_msg_id, user_audio_url)
 
