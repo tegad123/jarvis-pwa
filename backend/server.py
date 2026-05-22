@@ -20,22 +20,24 @@ Endpoints:
 Runs on Mac Mini, exposed via Cloudflare tunnel.
 """
 
+import asyncio
 import io
 import logging
 import os
 import re
 import sqlite3
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -47,7 +49,7 @@ from chat_auth import (
     require_auth,
     verify_password,
 )
-from elevenlabs_tts import synthesize_voice
+from elevenlabs_tts import synthesize_voice_stream
 import gateway_client
 from jarvis_brain import JARVIS_VOICE_SYSTEM, answer_with_voice_brain
 
@@ -225,6 +227,10 @@ app.add_middleware(
 # Audio filenames are <uuid4hex>.<webm|mp3>. Strict regex so path
 # components / ".." can't slip through GET /chat/api/audio/{filename}.
 _AUDIO_FILENAME_RE = re.compile(r"^[0-9a-f]{32}\.(webm|mp3)$")
+_TTS_STREAM_TASKS: set[asyncio.Task] = set()
+TTS_FIRST_CHUNK_TIMEOUT_SECONDS = 15.0
+TTS_STREAM_POLL_SECONDS = 0.1
+TTS_STREAM_IDLE_TIMEOUT_SECONDS = 90.0
 
 
 async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
@@ -352,6 +358,93 @@ def _set_message_audio(message_id: str, audio_url: str) -> None:
             "UPDATE messages SET has_audio = 1, audio_url = ? WHERE message_id = ?",
             (audio_url, message_id),
         )
+
+
+def _done_marker(path: Path) -> Path:
+    return path.with_name(path.name + ".done")
+
+
+def _error_marker(path: Path) -> Path:
+    return path.with_name(path.name + ".error")
+
+
+async def _write_streaming_voice_file(
+    *,
+    path: Path,
+    chat_id: str,
+    text: str,
+    first_chunk_ready: asyncio.Event,
+    error_holder: dict[str, Exception],
+) -> None:
+    done_path = _done_marker(path)
+    error_path = _error_marker(path)
+    for marker in (done_path, error_path):
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
+
+    bytes_written = 0
+    try:
+        with path.open("wb") as out:
+            async for chunk in synthesize_voice_stream(
+                text=text,
+                api_key=ELEVENLABS_API_KEY,
+                voice_id=ELEVENLABS_VOICE_ID,
+                model=ELEVENLABS_MODEL,
+            ):
+                out.write(chunk)
+                out.flush()
+                bytes_written += len(chunk)
+                if not first_chunk_ready.is_set():
+                    log.info(
+                        f"[VOICE {chat_id}] TTS first streaming chunk "
+                        f"{len(chunk)} bytes -> {path.name}"
+                    )
+                    first_chunk_ready.set()
+        done_path.touch()
+        log.info(f"[VOICE {chat_id}] TTS stream complete {bytes_written} bytes -> {path.name}")
+    except Exception as exc:
+        error_holder["exception"] = exc
+        try:
+            error_path.write_text(repr(exc))
+        except Exception:
+            pass
+        log.exception(f"[VOICE {chat_id}] streaming TTS failed after {bytes_written} bytes")
+    finally:
+        if not first_chunk_ready.is_set():
+            first_chunk_ready.set()
+
+
+def _track_tts_task(task: asyncio.Task) -> None:
+    _TTS_STREAM_TASKS.add(task)
+    task.add_done_callback(_TTS_STREAM_TASKS.discard)
+
+
+async def _iter_growing_audio_file(path: Path) -> AsyncIterator[bytes]:
+    pos = 0
+    last_progress = time.monotonic()
+    done_path = _done_marker(path)
+    error_path = _error_marker(path)
+
+    while True:
+        if path.is_file():
+            size = path.stat().st_size
+            if size > pos:
+                with path.open("rb") as f:
+                    f.seek(pos)
+                    data = f.read(size - pos)
+                pos = size
+                last_progress = time.monotonic()
+                yield data
+                continue
+
+        if done_path.exists() or error_path.exists():
+            break
+        if time.monotonic() - last_progress > TTS_STREAM_IDLE_TIMEOUT_SECONDS:
+            log.warning(f"streaming audio timed out while waiting for {path.name}")
+            break
+        await asyncio.sleep(TTS_STREAM_POLL_SECONDS)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -538,22 +631,40 @@ async def chat_voice_message(
     )
     _set_message_audio(user_msg_id, user_audio_url)
 
-    # ElevenLabs TTS — if it fails, the assistant message still exists,
-    # just without playback. Frontend handles `audio_url=null` gracefully.
+    # ElevenLabs streaming TTS — return the stream URL as soon as the first
+    # MP3 bytes are on disk so the browser can buffer while generation
+    # continues. If TTS fails before the first chunk, the assistant message
+    # still exists without playback.
     assistant_audio_url: Optional[str] = None
-    try:
-        voice_bytes = await synthesize_voice(
+    assistant_audio_name = f"{uuid.uuid4().hex}.mp3"
+    assistant_audio_path = AUDIO_CACHE_DIR / assistant_audio_name
+    first_chunk_ready = asyncio.Event()
+    tts_error: dict[str, Exception] = {}
+    tts_task = asyncio.create_task(
+        _write_streaming_voice_file(
+            path=assistant_audio_path,
+            chat_id=chat_id,
             text=reply_text,
-            api_key=ELEVENLABS_API_KEY,
-            voice_id=ELEVENLABS_VOICE_ID,
-            model=ELEVENLABS_MODEL,
+            first_chunk_ready=first_chunk_ready,
+            error_holder=tts_error,
         )
-        assistant_audio_name = f"{uuid.uuid4().hex}.mp3"
-        (AUDIO_CACHE_DIR / assistant_audio_name).write_bytes(voice_bytes)
-        assistant_audio_url = f"/chat/api/audio/{assistant_audio_name}"
-        _set_message_audio(assistant_msg_id, assistant_audio_url)
+    )
+    _track_tts_task(tts_task)
+    try:
+        await asyncio.wait_for(
+            first_chunk_ready.wait(),
+            timeout=TTS_FIRST_CHUNK_TIMEOUT_SECONDS,
+        )
+        if tts_error:
+            raise tts_error["exception"]
+        if assistant_audio_path.is_file() and assistant_audio_path.stat().st_size > 0:
+            assistant_audio_url = f"/chat/api/audio-stream/{assistant_audio_name}"
+            _set_message_audio(assistant_msg_id, assistant_audio_url)
+    except asyncio.TimeoutError:
+        tts_task.cancel()
+        log.exception(f"[VOICE {chat_id}] TTS first chunk timed out; assistant text only")
     except Exception:
-        log.exception(f"[VOICE {chat_id}] TTS failed; assistant text only")
+        log.exception(f"[VOICE {chat_id}] TTS failed before first chunk; assistant text only")
 
     return {
         "user_message": {
@@ -590,6 +701,29 @@ async def chat_audio(filename: str):
         raise HTTPException(404, "audio not found")
     media_type = "audio/webm" if filename.endswith(".webm") else "audio/mpeg"
     return FileResponse(str(path), media_type=media_type)
+
+
+@app.get("/chat/api/audio-stream/{filename}", dependencies=[Depends(require_auth)])
+async def chat_audio_stream(filename: str):
+    """
+    Stream a cached MP3 while the ElevenLabs writer is still appending to it.
+    Once the sidecar .done file exists, this behaves like a normal finite
+    chunked MP3 response.
+    """
+    if not _AUDIO_FILENAME_RE.match(filename) or not filename.endswith(".mp3"):
+        raise HTTPException(400, "invalid filename")
+    path = AUDIO_CACHE_DIR / filename
+    if not path.is_file():
+        raise HTTPException(404, "audio not found")
+    return StreamingResponse(
+        _iter_growing_audio_file(path),
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
