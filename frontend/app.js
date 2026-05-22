@@ -4,6 +4,7 @@
 
 const API_BASE = '';   // same-origin (served by FastAPI)
 const PLAYBACK_SPEED_KEY = 'jarvis_playback_speed';
+const SILENT_WAV_DATA_URI = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YQAAAAA=';
 
 const state = {
   authenticated: false,
@@ -95,6 +96,12 @@ const chat = {
       queued: null,
       queuedByChat: {},
       tapToPlay: {},
+      unlock: {
+        attempted: false,
+        audioContext: null,
+        silentAudio: null,
+        mediaSources: new WeakMap(),
+      },
       speed: readPlaybackSpeed(),
     },
     settingsOpen: false,
@@ -376,6 +383,7 @@ const chat = {
       this.stopRecording();
       return;
     }
+    this.unlockAudioPlayback();
     this.cancelVisibleTapToPlay();
     this.pauseCurrentAudio({ clearQueue: true });
     try {
@@ -704,6 +712,77 @@ const chat = {
     this.el.micStatus.classList.remove('listening');
   },
 
+  unlockAudioPlayback() {
+    const unlock = this.state.audio.unlock;
+    unlock.attempted = true;
+    console.log('[voice-debug] audio unlock attempted');
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass && !unlock.audioContext) {
+      try {
+        const ctx = new AudioContextClass();
+        unlock.audioContext = ctx;
+        const source = ctx.createBufferSource();
+        source.buffer = ctx.createBuffer(1, 1, 22050);
+        source.connect(ctx.destination);
+        source.start(0);
+        ctx.resume?.()
+          .then(() => console.log('[voice-debug] audio context unlocked', { state: ctx.state }))
+          .catch((err) => console.log(`[voice-debug] audio context unlock rejected: ${err?.name || 'Error'}: ${err?.message || ''}`));
+      } catch (err) {
+        console.log(`[voice-debug] audio context unlock failed: ${err?.name || 'Error'}: ${err?.message || ''}`);
+      }
+    } else if (unlock.audioContext?.state === 'suspended') {
+      unlock.audioContext.resume?.()
+        .then(() => console.log('[voice-debug] audio context resumed', { state: unlock.audioContext.state }))
+        .catch((err) => console.log(`[voice-debug] audio context resume rejected: ${err?.name || 'Error'}: ${err?.message || ''}`));
+    }
+
+    if (!unlock.silentAudio) {
+      try {
+        const silentAudio = new Audio(SILENT_WAV_DATA_URI);
+        silentAudio.preload = 'auto';
+        silentAudio.setAttribute('playsinline', '');
+        unlock.silentAudio = silentAudio;
+      } catch (err) {
+        console.log(`[voice-debug] silent audio create failed: ${err?.name || 'Error'}: ${err?.message || ''}`);
+      }
+    }
+
+    if (unlock.silentAudio) {
+      try {
+        unlock.silentAudio.currentTime = 0;
+      } catch {}
+      unlock.silentAudio.play()
+        .then(() => console.log('[voice-debug] silent audio unlocked'))
+        .catch((err) => console.log(`[voice-debug] silent audio unlock rejected: ${err?.name || 'Error'}: ${err?.message || ''}`));
+    }
+  },
+
+  prepareUnlockedAudioElement(audio) {
+    audio.setAttribute('playsinline', '');
+    audio.preload = 'auto';
+
+    const unlock = this.state.audio.unlock;
+    const ctx = unlock.audioContext;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      ctx.resume?.().catch((err) => {
+        console.log(`[voice-debug] audio context resume before playback rejected: ${err?.name || 'Error'}: ${err?.message || ''}`);
+      });
+    }
+    if (!unlock.mediaSources.has(audio)) {
+      try {
+        const source = ctx.createMediaElementSource(audio);
+        source.connect(ctx.destination);
+        unlock.mediaSources.set(audio, source);
+        console.log('[voice-debug] response audio connected to unlocked context');
+      } catch (err) {
+        console.log(`[voice-debug] response audio context connect failed: ${err?.name || 'Error'}: ${err?.message || ''}`);
+      }
+    }
+  },
+
   audioItemKey(item) {
     return item?.messageId || `${item?.chatId || 'unknown'}:${item?.url || 'unknown'}`;
   },
@@ -746,6 +825,7 @@ const chat = {
     if (source !== 'user tap') this.removeTapToPlayButton(item);
 
     const audio = new Audio(item.url);
+    this.prepareUnlockedAudioElement(audio);
     audio.playbackRate = this.state.audio.speed;
     this.state.audio.current = audio;
     this.state.audio.bubble = item.bubble || null;
