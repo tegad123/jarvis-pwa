@@ -33,7 +33,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
@@ -292,7 +292,7 @@ def _call_universal_bridge(
     openclaw_session_id: str,
     sender: str,
     calendar_id: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     if not BRIDGE_SCRIPT.is_file():
         raise RuntimeError(f"bridge script not found: {BRIDGE_SCRIPT}")
 
@@ -340,7 +340,10 @@ def _call_universal_bridge(
     response_text = (payload.get("response_text") or "").strip()
     if errors or not response_text:
         raise RuntimeError(f"bridge errors={errors!r}; response_empty={not response_text}")
-    return response_text
+    payload["response_text"] = response_text
+    if not isinstance(payload.get("actions_taken"), list):
+        payload["actions_taken"] = []
+    return payload
 
 
 def _audit_bridge_context(request: Request) -> tuple[str, Optional[str]]:
@@ -357,7 +360,7 @@ async def _exchange_turn(
     channel: str,
     sender: str = BRIDGE_SENDER,
     calendar_id: Optional[str] = None,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, str, str, list[dict[str, Any]]]:
     """
     Append one user → assistant turn to an existing chat.
 
@@ -366,9 +369,9 @@ async def _exchange_turn(
     msg, bump last_message_at.
 
     Returns (user_msg_id, assistant_msg_id, assistant_text,
-    assistant_created_at). The voice-message endpoint uses user_msg_id
-    + assistant_msg_id to UPDATE both rows with audio metadata after
-    the gateway round-trip.
+    assistant_created_at, actions_taken). The voice-message endpoint uses
+    user_msg_id + assistant_msg_id to UPDATE both rows with audio metadata
+    after the gateway round-trip.
 
     Raises 404 if chat_id does not exist. Bridge failures are logged with
     [bridge-error] and return a graceful user-facing response.
@@ -401,7 +404,7 @@ async def _exchange_turn(
         openclaw_session_id = _get_or_create_openclaw_session_id(conn, chat_id)
 
     try:
-        reply_text = await asyncio.to_thread(
+        bridge_payload = await asyncio.to_thread(
             _call_universal_bridge,
             chat_id=chat_id,
             user_content=user_content,
@@ -410,18 +413,22 @@ async def _exchange_turn(
             sender=sender,
             calendar_id=calendar_id,
         )
+        reply_text = bridge_payload["response_text"]
+        actions_taken = bridge_payload.get("actions_taken") or []
     except subprocess.TimeoutExpired:
         log.exception(
             f"[bridge-error] bridge timed out for chat={chat_id} "
             f"channel={channel} session={openclaw_session_id}"
         )
         reply_text = "Sorry, I had trouble with that. Could you try again?"
+        actions_taken = []
     except Exception:
         log.exception(
             f"[bridge-error] bridge failed for chat={chat_id} "
             f"channel={channel} session={openclaw_session_id}"
         )
         reply_text = "Sorry, I had trouble with that. Could you try again?"
+        actions_taken = []
 
     assistant_msg_id = uuid.uuid4().hex
     assistant_now = _now_iso()
@@ -436,7 +443,7 @@ async def _exchange_turn(
             (assistant_now, chat_id),
         )
 
-    return user_msg_id, assistant_msg_id, reply_text, assistant_now
+    return user_msg_id, assistant_msg_id, reply_text, assistant_now, actions_taken
 
 
 def _set_message_audio(message_id: str, audio_url: str) -> None:
@@ -653,7 +660,7 @@ async def chat_send_message(chat_id: str, req: MessageRequest, request: Request)
         raise HTTPException(400, "content required")
 
     sender, calendar_id = _audit_bridge_context(request)
-    _, assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
+    _, assistant_msg_id, reply_text, assistant_now, actions_taken = await _exchange_turn(
         chat_id=chat_id,
         user_content=content,
         channel="pwa-chat",
@@ -668,6 +675,7 @@ async def chat_send_message(chat_id: str, req: MessageRequest, request: Request)
         "created_at": assistant_now,
         "has_audio": False,
         "audio_url": None,
+        "actions_taken": actions_taken,
     }
 
 
@@ -715,7 +723,7 @@ async def chat_voice_message(
 
     # Persist user → universal bridge → assistant.
     sender, calendar_id = _audit_bridge_context(request)
-    user_msg_id, assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
+    user_msg_id, assistant_msg_id, reply_text, assistant_now, actions_taken = await _exchange_turn(
         chat_id=chat_id,
         user_content=transcript,
         channel="pwa-voice",
@@ -776,6 +784,7 @@ async def chat_voice_message(
             "created_at": assistant_now,
             "has_audio": bool(assistant_audio_url),
             "audio_url": assistant_audio_url,
+            "actions_taken": actions_taken,
         },
     }
 
