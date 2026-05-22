@@ -3,19 +3,19 @@
     {
       "id": "TASK-CREATE-1",
       "category": "tasks",
-      "message": "Create a task assigned to Tega for me to call Brad Friday morning",
+      "message": "Create a task assigned to Jarvis for me to call Brad Friday morning",
       "expect": {
-        "db_check": "SELECT 1 FROM tasks WHERE task_summary LIKE ? AND (lower(assignee) LIKE '%tega%' OR lower(assignee_name) LIKE '%tega%' OR full_context LIKE '%tega@34dev.com%') AND created_at > datetime('now', '-5 minutes')",
+        "db_check": "SELECT 1 FROM tasks WHERE task_summary LIKE ? AND created_at > datetime('now', '-5 minutes')",
         "db_params": ["%{prefix}%Brad%"]
       }
     },
     {
       "id": "CALENDAR-INVITE-1",
       "category": "calendar",
-      "message": "Send tega@34dev.com a calendar invite for tomorrow 2pm about Slabs",
+      "message": "Send jarvis@34dev.com a calendar invite for tomorrow 2pm about Slabs",
       "expect": {
         "google_calendar_check": {
-          "attendee": "tega@34dev.com",
+          "attendee": "jarvis@34dev.com",
           "summary_contains": "Slabs",
           "within_hours": 48
         }

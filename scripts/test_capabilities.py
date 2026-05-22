@@ -44,11 +44,12 @@ DEFAULT_GOOGLE_TOKEN = Path(
         str(Path.home() / ".openclaw" / "workspace" / "credentials" / "google_token.json"),
     )
 )
-DEFAULT_CALENDAR_ID = os.getenv("JARVIS_CALENDAR_ID", "tega@34dev.com")
+DEFAULT_CALENDAR_ID = os.getenv("JARVIS_CALENDAR_ID", "jarvis@34dev.com")
 DEFAULT_AUDIT_SENDER = os.getenv("JARVIS_AUDIT_SENDER", "tega@34dev.com")
 SPENCER_CALENDAR_ID = os.getenv("JARVIS_SPENCER_CALENDAR_ID", "spencerhuck@34dev.com")
+TEGA_CALENDAR_ID = os.getenv("JARVIS_TEGA_CALENDAR_ID", "tega@34dev.com")
 DEFAULT_LOG_PATH = Path(os.getenv("JARVIS_SERVER_ERR_LOG", str(ROOT / "data" / "server.err.log")))
-SAFE_EMAILS = {"tega@34dev.com"}
+SAFE_EMAILS = {"jarvis@34dev.com"}
 BRIDGE_GRACEFUL_ERROR = "Sorry, I had trouble with that. Could you try again?"
 
 
@@ -201,9 +202,12 @@ def build_prompt(raw_message: str, prefix: str) -> str:
     return (
         f"{prefix} {raw_message.strip()}\n\n"
         "For this automated audit, act only on behalf of Tega "
-        "(tega@34dev.com), not Spencer. Use Tega as the requester, task owner, "
-        "calendar owner, and only allowed email/calendar recipient. Do not create "
-        "anything on Spencer's calendar or assign anything to Spencer. "
+        "(tega@34dev.com), not Spencer. Use Tega as the requester, but route all "
+        "test artifacts to Jarvis (jarvis@34dev.com): calendar writes must use "
+        "calendar_id jarvis@34dev.com, calendar attendees must be jarvis@34dev.com, "
+        "email recipients must be jarvis@34dev.com, and task assignees should be "
+        "Jarvis/jarvis@34dev.com when an assignee is needed. Do not create anything "
+        "on Spencer's or Tega's calendar, and do not assign anything to Spencer. "
         f"Include the exact marker {prefix} in any task title, calendar event "
         "title, email subject, or other artifact you create."
     )
@@ -382,6 +386,31 @@ def calendar_events_for_calendar(
     return [event for event in items if prefix.lower() in json.dumps(event).lower()]
 
 
+def try_calendar_events_for_calendar(
+    *,
+    token: str,
+    calendar_id: str,
+    prefix: str,
+    within_hours: int = 168,
+) -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        return (
+            calendar_events_for_calendar(
+                token=token,
+                calendar_id=calendar_id,
+                prefix=prefix,
+                within_hours=within_hours,
+            ),
+            None,
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 404):
+            return [], f"inaccessible:{exc.code}"
+        return [], f"HTTPError:{exc.code}"
+    except Exception as exc:  # noqa: BLE001
+        return [], f"{type(exc).__name__}: {exc}"
+
+
 def read_log_since(path: Path, offset: int) -> str:
     if not path.exists():
         return ""
@@ -485,7 +514,7 @@ def evaluate_expectations(
 def enforce_guardrails(tests: list[dict[str, Any]], prefix: str) -> list[dict[str, Any]]:
     safe_tests = []
     for test in tests:
-        message = build_prompt(test.get("message", ""), prefix)
+        message = substitute_prefix(test.get("message", ""), prefix)
         unsafe = found_unsafe_email(message)
         if unsafe:
             copied = dict(test)
@@ -509,14 +538,15 @@ def run(cfg: HarnessConfig) -> dict[str, Any]:
     cleanup: dict[str, Any] = {"calendar_deleted": 0, "tasks_completed": 0, "chat_deleted": False}
     isolation: dict[str, Any] = {
         "spencer_calendar_events": [],
+        "tega_calendar_events": [],
         "spencer_task_ids": [],
         "ok": True,
     }
 
     try:
-        if cfg.audit_sender.lower() != "tega@34dev.com" or cfg.calendar_id.lower() != "tega@34dev.com":
+        if cfg.audit_sender.lower() != "tega@34dev.com" or cfg.calendar_id.lower() != "jarvis@34dev.com":
             raise RuntimeError(
-                "audit harness must run as Tega only: "
+                "audit harness must run as Tega requester with Jarvis artifact target: "
                 f"audit_sender={cfg.audit_sender!r} calendar_id={cfg.calendar_id!r}"
             )
         if not cfg.dry_run:
@@ -615,26 +645,46 @@ def run(cfg: HarnessConfig) -> dict[str, Any]:
             )
     finally:
         if google_token:
-            try:
-                isolation["spencer_calendar_events"] = [
-                    {
-                        "id": e.get("id"),
-                        "summary": e.get("summary"),
-                        "start": e.get("start"),
-                    }
-                    for e in calendar_events_for_calendar(
-                        token=google_token,
-                        calendar_id=SPENCER_CALENDAR_ID,
-                        prefix=prefix,
-                    )
-                ]
-            except Exception as exc:  # noqa: BLE001
-                isolation["spencer_calendar_error"] = f"{type(exc).__name__}: {exc}"
+            spencer_events, spencer_error = try_calendar_events_for_calendar(
+                token=google_token,
+                calendar_id=SPENCER_CALENDAR_ID,
+                prefix=prefix,
+            )
+            isolation["spencer_calendar_events"] = [
+                {
+                    "id": e.get("id"),
+                    "summary": e.get("summary"),
+                    "start": e.get("start"),
+                }
+                for e in spencer_events
+            ]
+            if spencer_error:
+                isolation["spencer_calendar_error"] = spencer_error
+
+            tega_events, tega_error = try_calendar_events_for_calendar(
+                token=google_token,
+                calendar_id=TEGA_CALENDAR_ID,
+                prefix=prefix,
+            )
+            isolation["tega_calendar_events"] = [
+                {
+                    "id": e.get("id"),
+                    "summary": e.get("summary"),
+                    "start": e.get("start"),
+                }
+                for e in tega_events
+            ]
+            if tega_error:
+                isolation["tega_calendar_error"] = tega_error
         try:
             isolation["spencer_task_ids"] = spencer_task_rows_for_prefix(cfg.tasks_db, prefix)
         except Exception as exc:  # noqa: BLE001
             isolation["spencer_task_error"] = f"{type(exc).__name__}: {exc}"
-        isolation["ok"] = not isolation["spencer_calendar_events"] and not isolation["spencer_task_ids"]
+        isolation["ok"] = (
+            not isolation["spencer_calendar_events"]
+            and not isolation["spencer_task_ids"]
+            and not isolation["tega_calendar_events"]
+        )
         if not isolation["ok"]:
             results.append(
                 TestResult(
@@ -642,7 +692,7 @@ def run(cfg: HarnessConfig) -> dict[str, Any]:
                     category="infrastructure",
                     status="failed",
                     message=prefix,
-                    errors=["test artifact landed on Spencer identity"],
+                    errors=["test artifact landed on Spencer or Tega identity"],
                     checks=[isolation],
                 )
             )
