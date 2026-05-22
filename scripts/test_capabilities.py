@@ -29,7 +29,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CASES = ROOT / "scripts" / "test_cases.json"
 DEFAULT_OUT_DIR = ROOT / "data"
-DEFAULT_PWA_URL = os.getenv("PWA_URL", "https://app.34jarvis.uk").rstrip("/")
+DEFAULT_PWA_URL = os.getenv("PWA_URL", "http://127.0.0.1:8765").rstrip("/")
 DEFAULT_PWA_PASSWORD = os.getenv("JARVIS_PWA_PASSWORD", "34811")
 DEFAULT_PWA_DB = Path(os.getenv("JARVIS_DB_PATH", str(ROOT / "backend" / "data" / "jarvis.db")))
 DEFAULT_TASKS_DB = Path(
