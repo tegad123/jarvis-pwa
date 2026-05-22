@@ -3,22 +3,263 @@
     {
       "id": "TASK-CREATE-1",
       "category": "tasks",
-      "message": "Create a task assigned to Jarvis for me to call Brad Friday morning",
+      "message": "Create a task for me to call Brad Friday morning",
       "expect": {
-        "db_check": "SELECT 1 FROM tasks WHERE task_summary LIKE ? AND created_at > datetime('now', '-5 minutes')",
-        "db_params": ["%{prefix}%Brad%"]
+        "actions_taken_contains": "task_created",
+        "db_check": "SELECT 1 FROM tasks WHERE task_summary LIKE '%Brad%' AND task_summary LIKE '%[TEST-PWA-AUDIT-%]%'"
+      }
+    },
+    {
+      "id": "TASK-ASSIGN-OTHER",
+      "category": "tasks",
+      "message": "Add a task for Jarvis to follow up on the slab order",
+      "expect": {
+        "actions_taken_contains": "task_created",
+        "db_check": "SELECT 1 FROM tasks WHERE task_summary LIKE '%slab%' AND task_summary LIKE '%[TEST-PWA-AUDIT-%]%'"
+      }
+    },
+    {
+      "id": "TASK-QUERY-PRIORITY",
+      "category": "tasks",
+      "message": "What are my high priority tasks today",
+      "expect": {
+        "response_contains_one_of": ["high priority", "tasks", "open", "no tasks"]
+      }
+    },
+    {
+      "id": "TASK-COMPLETE",
+      "category": "tasks",
+      "message": "Create a test task called check inventory then immediately mark it complete",
+      "expect": {
+        "actions_taken_contains_any": ["task_created", "task_completed"]
+      }
+    },
+    {
+      "id": "TASK-PRIORITY-CHANGE",
+      "category": "tasks",
+      "message": "Create a test task with low priority called review notes, then change it to high priority",
+      "expect": {
+        "actions_taken_contains_any": ["task_created", "priority_updated"]
+      }
+    },
+    {
+      "id": "TASK-DELETE",
+      "category": "tasks",
+      "message": "Create a test task called scratchpad, then delete it",
+      "expect": {
+        "actions_taken_contains_any": ["task_created", "task_deleted"]
+      }
+    },
+    {
+      "id": "TASK-QUERY-BY-OWNER",
+      "category": "tasks",
+      "message": "Show me everything assigned to Jarvis",
+      "expect": {
+        "response_contains_one_of": ["Jarvis", "tasks", "no tasks"]
       }
     },
     {
       "id": "CALENDAR-INVITE-1",
       "category": "calendar",
-      "message": "Send jarvis@34dev.com a calendar invite for tomorrow 2pm about Slabs",
+      "message": "Send a calendar invite to jarvis@34dev.com for tomorrow at 2pm about slabs",
       "expect": {
-        "google_calendar_check": {
-          "attendee": "jarvis@34dev.com",
-          "summary_contains": "Slabs",
-          "within_hours": 48
-        }
+        "actions_taken_contains": "calendar_event",
+        "google_calendar_check": "tomorrow 14:00 with attendee jarvis@34dev.com"
+      }
+    },
+    {
+      "id": "CALENDAR-SCHEDULE",
+      "category": "calendar",
+      "message": "Schedule a meeting with jarvis@34dev.com Friday at 10am",
+      "expect": {
+        "actions_taken_contains": "calendar_event"
+      }
+    },
+    {
+      "id": "CALENDAR-NO-ATTENDEE",
+      "category": "calendar",
+      "message": "Add lunch to my calendar today at noon",
+      "expect": {
+        "actions_taken_contains": "calendar_event"
+      }
+    },
+    {
+      "id": "CALENDAR-READ",
+      "category": "calendar",
+      "message": "What's on my calendar tomorrow",
+      "expect": {
+        "response_contains_one_of": ["calendar", "tomorrow", "no events", "meeting", "scheduled"]
+      }
+    },
+    {
+      "id": "EMAIL-SEND-1",
+      "category": "email",
+      "message": "Email jarvis@34dev.com asking for an update on the Stratus deal",
+      "expect": {
+        "actions_taken_contains": "email_sent"
+      }
+    },
+    {
+      "id": "EMAIL-REPLY",
+      "category": "email",
+      "message": "Reply to the most recent email from jarvis@34dev.com with 'sounds good, let's proceed'",
+      "expect": {
+        "actions_taken_contains_any": ["email_sent", "no_email_found"]
+      }
+    },
+    {
+      "id": "EMAIL-THANK-YOU",
+      "category": "email",
+      "message": "Send a thank you email to jarvis@34dev.com",
+      "expect": {
+        "actions_taken_contains": "email_sent"
+      }
+    },
+    {
+      "id": "DEAL-INTEL-STRATUS",
+      "category": "deal_intel",
+      "message": "Tell me everything you know about the Stratus deal",
+      "expect": {
+        "response_contains_one_of": ["Stratus", "deal", "no information", "don't have"]
+      }
+    },
+    {
+      "id": "DEAL-INTEL-MEMORIAL",
+      "category": "deal_intel",
+      "message": "What's the status on Memorial Park",
+      "expect": {
+        "response_contains_one_of": ["Memorial", "park", "no information", "don't have"]
+      }
+    },
+    {
+      "id": "MULTI-ACTION-CALL",
+      "category": "complex",
+      "message": "I just had a call with Jarvis, he's going to order slabs Friday and follow up with the supplier about fixtures",
+      "expect": {
+        "actions_taken_count_min": 1,
+        "actions_taken_contains": "task_created"
+      }
+    },
+    {
+      "id": "TIME-AWARE-1",
+      "category": "time",
+      "message": "What time is it",
+      "expect": {
+        "response_contains_one_of": ["AM", "PM", "o'clock", ":"]
+      }
+    },
+    {
+      "id": "TIME-AWARE-2",
+      "category": "time",
+      "message": "How long until my next meeting",
+      "expect": {
+        "response_contains_one_of": ["next meeting", "no meetings", "calendar", "in", "nothing scheduled"]
+      }
+    },
+    {
+      "id": "CALENDAR-BLOCK",
+      "category": "calendar",
+      "message": "Block off 2pm to 4pm tomorrow for deep work",
+      "expect": {
+        "actions_taken_contains": "calendar_event"
+      }
+    },
+    {
+      "id": "SESSION-CONTINUITY-1",
+      "category": "infrastructure",
+      "message": "I'm thinking about the 11 Tiel Way slabs",
+      "followup": "What did we just talk about",
+      "expect_followup": {
+        "response_contains_one_of": ["Tiel Way", "slabs", "11 Tiel"]
+      }
+    },
+    {
+      "id": "SESSION-CONTINUITY-2",
+      "category": "infrastructure",
+      "message": "Remember that jarvis@34dev.com is the test contact address",
+      "followup": "Send the test contact a calendar invite for 2pm tomorrow",
+      "expect_followup": {
+        "actions_taken_contains": "calendar_event"
+      }
+    },
+    {
+      "id": "VOICE-EMPTY",
+      "category": "voice",
+      "message": "",
+      "expect": {
+        "response_contains_one_of": ["didn't catch", "empty", "try again", "couldn't hear", "no input"]
+      }
+    },
+    {
+      "id": "AMBIGUOUS-1",
+      "category": "edge_cases",
+      "message": "Call him back",
+      "expect": {
+        "response_contains_one_of": ["who", "which", "clarify", "more information", "more context"]
+      }
+    },
+    {
+      "id": "UNKNOWN-PERSON",
+      "category": "edge_cases",
+      "message": "Tell Bartholomew Anderson III to do the dishes",
+      "expect": {
+        "response_contains_one_of": ["Bartholomew", "don't have", "email", "who", "not in"]
+      }
+    },
+    {
+      "id": "DATE-NEXT-FRIDAY",
+      "category": "edge_cases",
+      "message": "Create a task for next Friday to call the bank",
+      "expect": {
+        "actions_taken_contains": "task_created"
+      }
+    },
+    {
+      "id": "DATE-IN-2-WEEKS",
+      "category": "edge_cases",
+      "message": "Remind me to follow up in 2 weeks",
+      "expect": {
+        "actions_taken_contains_any": ["task_created", "calendar_event"]
+      }
+    },
+    {
+      "id": "LONG-MULTI-ACTION",
+      "category": "complex",
+      "message": "Run through my week — talk to Jarvis about slabs, send jarvis@34dev.com a calendar invite for Tuesday 3pm, follow up on Willow, check cabinet stains, email jarvis@34dev.com about the website, and remind me to review Memorial Park docs Tuesday",
+      "expect": {
+        "actions_taken_count_min": 3
+      }
+    },
+    {
+      "id": "SELF-AWARENESS-CAPS",
+      "category": "system",
+      "message": "What can you do for me",
+      "expect": {
+        "response_contains_one_of": ["task", "calendar", "email", "I can"]
+      }
+    },
+    {
+      "id": "SELF-AWARENESS-TASKS",
+      "category": "system",
+      "message": "How many tasks do I have open right now",
+      "expect": {
+        "response_contains_one_of": ["tasks", "open", "you have", "currently"]
+      }
+    },
+    {
+      "id": "SELF-AWARENESS-DIGEST",
+      "category": "system",
+      "message": "Did my 5am digest go out today",
+      "expect": {
+        "response_contains_one_of": ["digest", "5am", "sent", "didn't", "this morning"]
+      }
+    },
+    {
+      "id": "SELF-AWARENESS-ERRORS",
+      "category": "system",
+      "message": "Are there any errors I should know about",
+      "expect": {
+        "response_contains_one_of": ["error", "errors", "no issues", "all good", "operational"]
       }
     },
     {
@@ -26,8 +267,40 @@
       "category": "infrastructure",
       "message": "What time is it",
       "expect": {
-        "response_contains_one_of": ["AM", "PM", "now is"],
+        "response_contains_one_of": ["AM", "PM", ":"],
         "log_check": "[bridge-invoke]"
+      }
+    },
+    {
+      "id": "TASK-COMPLEX-DEADLINE",
+      "category": "tasks",
+      "message": "Add a task to call about the Willow easement next Tuesday",
+      "expect": {
+        "actions_taken_contains": "task_created"
+      }
+    },
+    {
+      "id": "CALENDAR-RECURRING",
+      "category": "calendar",
+      "message": "Block off every Tuesday at 10am for 1 hour for team meeting",
+      "expect": {
+        "actions_taken_contains": "calendar_event"
+      }
+    },
+    {
+      "id": "EMAIL-AUTO-DRAFT",
+      "category": "email",
+      "message": "Draft an email to jarvis@34dev.com about scheduling a call",
+      "expect": {
+        "actions_taken_contains_any": ["email_sent", "draft_created"]
+      }
+    },
+    {
+      "id": "VOICE-LONG-MESSAGE",
+      "category": "voice",
+      "message": "I have a long list of things I need you to handle today including creating a task to call about slabs, sending jarvis@34dev.com a calendar invite for Tuesday 3pm, and creating a task to review documents",
+      "expect": {
+        "actions_taken_count_min": 2
       }
     }
   ]

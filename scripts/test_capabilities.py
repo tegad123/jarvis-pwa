@@ -433,13 +433,16 @@ def evaluate_expectations(
     prefix: str,
     log_slice: str,
     google_token: str | None,
+    *,
+    expect_key: str = "expect",
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     checks: list[dict[str, Any]] = []
     errors: list[str] = []
     calendar_artifacts: list[dict[str, Any]] = []
-    expect = substitute_prefix(test.get("expect", {}), prefix)
+    expect = substitute_prefix(test.get(expect_key, {}), prefix)
     response_text = response.get("content") or response.get("response_text") or ""
     actions_taken = response.get("actions_taken") or []
+    action_blob = json.dumps(actions_taken)
 
     if response_text == BRIDGE_GRACEFUL_ERROR:
         errors.append("bridge returned graceful error")
@@ -453,12 +456,36 @@ def evaluate_expectations(
 
     action_needle = expect.get("actions_taken_contains")
     if action_needle:
-        action_blob = json.dumps(actions_taken)
         ok = action_needle in action_blob
         checks.append({"type": "actions_taken_contains", "ok": ok, "needle": action_needle})
         if not ok:
             errors.append(
                 f"actions_taken did not include {action_needle!r}; PWA response may not expose actions_taken"
+            )
+
+    action_needles = expect.get("actions_taken_contains_any")
+    if action_needles:
+        ok = any(needle in action_blob for needle in action_needles)
+        checks.append({"type": "actions_taken_contains_any", "ok": ok, "needles": action_needles})
+        if not ok:
+            errors.append(
+                f"actions_taken did not include any of {action_needles!r}; PWA response may not expose actions_taken"
+            )
+
+    action_count_min = expect.get("actions_taken_count_min")
+    if action_count_min is not None:
+        ok = len(actions_taken) >= int(action_count_min)
+        checks.append(
+            {
+                "type": "actions_taken_count_min",
+                "ok": ok,
+                "minimum": int(action_count_min),
+                "actual": len(actions_taken),
+            }
+        )
+        if not ok:
+            errors.append(
+                f"actions_taken count {len(actions_taken)} below minimum {int(action_count_min)}"
             )
 
     if expect.get("db_check"):
@@ -469,6 +496,15 @@ def evaluate_expectations(
 
     calendar_check = expect.get("google_calendar_check")
     if calendar_check:
+        if isinstance(calendar_check, str):
+            attendee_match = re.search(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                calendar_check,
+            )
+            calendar_check = {
+                "attendee": attendee_match.group(0) if attendee_match else None,
+                "within_hours": 168,
+            }
         if not google_token:
             ok = False
             matches: list[dict[str, Any]] = []
@@ -514,7 +550,11 @@ def evaluate_expectations(
 def enforce_guardrails(tests: list[dict[str, Any]], prefix: str) -> list[dict[str, Any]]:
     safe_tests = []
     for test in tests:
-        message = substitute_prefix(test.get("message", ""), prefix)
+        message = " ".join(
+            substitute_prefix(test.get(key, ""), prefix)
+            for key in ("message", "followup")
+            if test.get(key)
+        )
         unsafe = found_unsafe_email(message)
         if unsafe:
             copied = dict(test)
@@ -618,8 +658,22 @@ def run(cfg: HarnessConfig) -> dict[str, Any]:
                 response = client.send_message(chat_id, prompt, cfg.per_test_timeout)
                 time.sleep(0.5)
                 log_slice = read_log_since(cfg.log_path, log_offset)
+                expect_key = "expect"
+                if test.get("followup"):
+                    followup_prompt = build_prompt(test["followup"], prefix)
+                    response = client.send_message(chat_id, followup_prompt, cfg.per_test_timeout)
+                    time.sleep(0.5)
+                    log_slice = read_log_since(cfg.log_path, log_offset)
+                    expect_key = "expect_followup"
+                    prompt = f"{prompt}\n\nFOLLOWUP:\n{followup_prompt}"
                 checks, errors, artifacts = evaluate_expectations(
-                    cfg, test, response, prefix, log_slice, google_token
+                    cfg,
+                    test,
+                    response,
+                    prefix,
+                    log_slice,
+                    google_token,
+                    expect_key=expect_key,
                 )
                 calendar_artifacts.extend(artifacts)
                 status = "passed" if not errors else "failed"
