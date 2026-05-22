@@ -1,5 +1,5 @@
 /* ════════════════════════════════════════════════════════════
-   asset-version: c9a4411
+   asset-version: voice-playback-fallback
    JARVIS PWA — design tokens
    Refined minimal dark, lime accent, JetBrains Mono + Syne
    ════════════════════════════════════════════════════════════ */
@@ -361,6 +361,36 @@ button {
 }
 .chat-bubble-text {
   min-width: 0;
+}
+.chat-tap-play-button {
+  width: 24px;
+  height: 24px;
+  margin-left: 8px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid rgba(201,242,92,0.34);
+  background: rgba(201,242,92,0.08);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+.chat-tap-play-button:hover {
+  background: rgba(201,242,92,0.14);
+  border-color: rgba(201,242,92,0.55);
+}
+.chat-tap-play-button:active {
+  transform: scale(0.96);
+}
+.chat-tap-play-button svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linejoin: round;
 }
 .chat-speaking-indicator {
   display: none;

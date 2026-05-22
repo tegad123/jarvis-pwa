@@ -10,6 +10,7 @@ const state = {
 };
 
 const $ = (sel) => document.querySelector(sel);
+const cssEscape = (value) => window.CSS?.escape ? CSS.escape(value) : String(value).replace(/["\\]/g, '\\$&');
 
 const shellAuth = {
   async init() {
@@ -93,6 +94,7 @@ const chat = {
       bubble: null,
       queued: null,
       queuedByChat: {},
+      tapToPlay: {},
       speed: readPlaybackSpeed(),
     },
     settingsOpen: false,
@@ -290,6 +292,18 @@ const chat = {
     div.appendChild(text);
 
     if (m.role === 'assistant') {
+      if (m.audio_url && this.state.audio.tapToPlay[this.audioItemKey({
+        messageId: m.message_id,
+        chatId: m.chat_id || this.state.currentChatId,
+        url: m.audio_url,
+      })]) {
+        this.renderTapToPlayButton(div, {
+          url: m.audio_url,
+          chatId: m.chat_id || this.state.currentChatId,
+          messageId: m.message_id,
+          bubble: div,
+        });
+      }
       const speaking = document.createElement('div');
       speaking.className = 'chat-speaking-indicator';
       speaking.textContent = '🔊 speaking...';
@@ -362,6 +376,7 @@ const chat = {
       this.stopRecording();
       return;
     }
+    this.cancelVisibleTapToPlay();
     this.pauseCurrentAudio({ clearQueue: true });
     try {
       await this.startRecording(e);
@@ -537,21 +552,43 @@ const chat = {
       if (!r.ok) throw new Error(`server ${r.status}`);
 
       const data = await r.json();
+      console.log('[voice-debug] voice-message response:', data);
       this.logMicState('upload-success', {
         chatId,
         hasAssistantAudio: !!data.assistant_message?.audio_url,
       });
       let assistantEl = null;
       if (this.state.currentChatId === chatId) {
+        console.log('[voice-debug] appending voice messages:', {
+          chatId,
+          userAudioUrl: data.user_message?.audio_url,
+          assistantAudioUrl: data.assistant_message?.audio_url,
+        });
         this.appendMessage(data.user_message);
         assistantEl = this.appendMessage(data.assistant_message);
       }
       if (this.state.currentChatId === chatId && data.assistant_message?.audio_url) {
-        this.playAssistantAudio(data.assistant_message.audio_url, chatId, assistantEl);
+        console.log('[voice-debug] starting assistant audio playback:', {
+          chatId,
+          audioUrl: data.assistant_message.audio_url,
+          hasBubble: !!assistantEl,
+        });
+        this.playAssistantAudio(
+          data.assistant_message.audio_url,
+          chatId,
+          assistantEl,
+          data.assistant_message.message_id
+        );
       } else if (data.assistant_message?.audio_url) {
+        console.log('[voice-debug] queueing assistant audio for inactive chat:', {
+          chatId,
+          currentChatId: this.state.currentChatId,
+          audioUrl: data.assistant_message.audio_url,
+        });
         this.state.audio.queuedByChat[chatId] = {
           url: data.assistant_message.audio_url,
           chatId,
+          messageId: data.assistant_message.message_id,
           bubble: null,
         };
       }
@@ -667,24 +704,46 @@ const chat = {
     this.el.micStatus.classList.remove('listening');
   },
 
-  playAssistantAudio(url, chatId, bubble) {
+  audioItemKey(item) {
+    return item?.messageId || `${item?.chatId || 'unknown'}:${item?.url || 'unknown'}`;
+  },
+
+  playAssistantAudio(url, chatId, bubble, messageId = null) {
+    console.log('[voice-debug] playAssistantAudio called:', {
+      url,
+      chatId,
+      currentChatId: this.state.currentChatId,
+      isRecording: this.isRecording(),
+      hasBubble: !!bubble,
+      messageId,
+    });
     if (!url || chatId !== this.state.currentChatId) return;
-    const item = { url, chatId, bubble };
+    const item = { url, chatId, bubble, messageId };
     if (this.isRecording()) {
+      console.log('[voice-debug] playback queued because recorder is active:', item);
       this.state.audio.queued = item;
       return;
     }
-    this.playAudioItem(item);
+    this.playAudioItem(item, { source: 'autoplay' });
   },
 
-  playAudioItem(item) {
+  playAudioItem(item, { source = 'autoplay' } = {}) {
+    console.log('[voice-debug] playAudioItem called:', {
+      item,
+      currentChatId: this.state.currentChatId,
+      isRecording: this.isRecording(),
+      playbackSpeed: this.state.audio.speed,
+      source,
+    });
     if (!item || item.chatId !== this.state.currentChatId) return;
     if (this.isRecording()) {
+      console.log('[voice-debug] playAudioItem re-queued because recorder is active:', item);
       this.state.audio.queued = item;
       return;
     }
     this.pauseCurrentAudio();
     this.clearMicStatus();
+    if (source !== 'user tap') this.removeTapToPlayButton(item);
 
     const audio = new Audio(item.url);
     audio.playbackRate = this.state.audio.speed;
@@ -693,9 +752,46 @@ const chat = {
     item.bubble?.classList.add('chat-bubble-speaking');
 
     const clear = () => this.clearCurrentAudio(audio);
-    audio.addEventListener('ended', clear, { once: true });
-    audio.addEventListener('error', clear, { once: true });
-    audio.play().catch(() => clear());
+    audio.addEventListener('ended', () => {
+      console.log('[voice-debug] audio ended', { url: item.url, source });
+      clear();
+    }, { once: true });
+    audio.addEventListener('error', () => {
+      console.log('[voice-debug] audio element error:', {
+        url: item.url,
+        error: audio.error,
+        networkState: audio.networkState,
+        readyState: audio.readyState,
+      });
+      clear();
+    }, { once: true });
+    console.log(`[voice-debug] play() attempted (${source})`, {
+      url: item.url,
+      networkState: audio.networkState,
+      readyState: audio.readyState,
+    });
+    audio.play()
+      .then(() => {
+        console.log('[voice-debug] play() resolved', {
+          url: item.url,
+          source,
+          duration: audio.duration,
+          readyState: audio.readyState,
+        });
+        this.removePendingTapToPlay(item);
+      })
+      .catch((err) => {
+        console.log(`[voice-debug] play() rejected: ${err?.name || 'Error'}: ${err?.message || ''}`, {
+          url: item.url,
+          source,
+          name: err?.name,
+          message: err?.message,
+          networkState: audio.networkState,
+          readyState: audio.readyState,
+        });
+        this.clearCurrentAudio(audio);
+        this.renderTapToPlayButton(item.bubble, item);
+      });
   },
 
   playQueuedAudio() {
@@ -711,7 +807,63 @@ const chat = {
     delete this.state.audio.queuedByChat[chatId];
     const bubbles = this.el.messages.querySelectorAll('.chat-bubble-assistant');
     item.bubble = bubbles[bubbles.length - 1] || null;
-    this.playAssistantAudio(item.url, chatId, item.bubble);
+    this.playAssistantAudio(item.url, chatId, item.bubble, item.messageId);
+  },
+
+  renderTapToPlayButton(bubble, item) {
+    if (!bubble || !item?.url) return;
+    const key = this.audioItemKey(item);
+    const persisted = {
+      url: item.url,
+      chatId: item.chatId,
+      messageId: item.messageId,
+    };
+    this.state.audio.tapToPlay[key] = persisted;
+    bubble.dataset.audioKey = key;
+    bubble.dataset.audioUrl = item.url;
+    bubble.dataset.chatId = item.chatId || '';
+    if (item.messageId) bubble.dataset.messageId = item.messageId;
+    if (bubble.querySelector('.chat-tap-play-button')) return;
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'chat-tap-play-button';
+    button.title = 'Tap to play response';
+    button.setAttribute('aria-label', 'Tap to play response');
+    button.innerHTML = `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M8 5v14l11-7z"></path>
+      </svg>
+    `;
+    button.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.playAudioItem({ ...persisted, bubble }, { source: 'user tap' });
+    });
+    bubble.querySelector('.chat-bubble-text')?.after(button);
+    console.log('[voice-debug] tap-to-play button rendered', persisted);
+  },
+
+  removeTapToPlayButton(item) {
+    const key = this.audioItemKey(item);
+    const safeKey = cssEscape(key);
+    const bubble = item?.bubble || this.el.messages?.querySelector(`[data-audio-key="${safeKey}"]`);
+    bubble?.querySelector('.chat-tap-play-button')?.remove();
+  },
+
+  removePendingTapToPlay(item) {
+    const key = this.audioItemKey(item);
+    delete this.state.audio.tapToPlay[key];
+    this.removeTapToPlayButton(item);
+  },
+
+  cancelVisibleTapToPlay() {
+    this.el.messages?.querySelectorAll('.chat-tap-play-button').forEach((button) => {
+      const bubble = button.closest('.chat-bubble');
+      const key = bubble?.dataset.audioKey;
+      if (key) delete this.state.audio.tapToPlay[key];
+      button.remove();
+    });
   },
 
   pauseCurrentAudio({ clearQueue = false } = {}) {
