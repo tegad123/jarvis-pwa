@@ -543,7 +543,26 @@ const chat = {
     }
 
     const chatId = this.state.currentChatId;
+    let pendingEl = null;
+    const progressTimers = [];
     try {
+      if (this.state.currentChatId === chatId) {
+        pendingEl = this.appendMessage({
+          role: 'assistant',
+          content: 'Processing voice…',
+          pending: true,
+        });
+        pendingEl.classList.add('chat-bubble-working');
+        progressTimers.push(setTimeout(() => {
+          if (pendingEl?.isConnected) pendingEl.querySelector('.chat-bubble-text').textContent = 'Transcribing audio…';
+        }, 2500));
+        progressTimers.push(setTimeout(() => {
+          if (pendingEl?.isConnected) pendingEl.querySelector('.chat-bubble-text').textContent = 'Jarvis is working…';
+        }, 9000));
+        progressTimers.push(setTimeout(() => {
+          if (pendingEl?.isConnected) pendingEl.querySelector('.chat-bubble-text').textContent = 'Still working on the actions…';
+        }, 30000));
+      }
       const form = new FormData();
       form.append('audio', blob, 'voice.webm');
       this.logMicState('upload-start', {
@@ -557,7 +576,14 @@ const chat = {
         body: form,
       });
       if (r.status === 401) { shellAuth.logout(); return; }
-      if (!r.ok) throw new Error(`server ${r.status}`);
+      if (!r.ok) {
+        let detail = '';
+        try {
+          const errPayload = await r.json();
+          detail = errPayload?.detail || '';
+        } catch {}
+        throw new Error(detail || `server ${r.status}`);
+      }
 
       const data = await r.json();
       console.log('[voice-debug] voice-message response:', data);
@@ -567,6 +593,8 @@ const chat = {
       });
       let assistantEl = null;
       if (this.state.currentChatId === chatId) {
+        pendingEl?.remove();
+        pendingEl = null;
         console.log('[voice-debug] appending voice messages:', {
           chatId,
           userAudioUrl: data.user_message?.audio_url,
@@ -609,8 +637,16 @@ const chat = {
         chatId,
         error: err.message || String(err),
       });
-      this.showMicStatus('voice failed');
+      const message = err.message && !err.message.startsWith('server ')
+        ? err.message
+        : "That request is taking longer than expected. The work may still be happening — check your inbox/calendar in 2 minutes. Or send me a simpler request and I'll handle it now.";
+      if (pendingEl?.isConnected) {
+        pendingEl.classList.remove('chat-bubble-pending', 'chat-bubble-working');
+        pendingEl.querySelector('.chat-bubble-text').textContent = message;
+      }
+      this.showMicStatus('still working');
     } finally {
+      progressTimers.forEach(clearTimeout);
       this.state.mic.pending = Math.max(0, (this.state.mic.pending || 1) - 1);
       this.micIdle();
     }

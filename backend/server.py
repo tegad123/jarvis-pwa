@@ -83,8 +83,15 @@ BRIDGE_SCRIPT = Path(
     )
 )
 BRIDGE_TIMEOUT_SECONDS = int(os.getenv("JARVIS_BRIDGE_TIMEOUT_SECONDS", "120"))
+VOICE_BRIDGE_TIMEOUT_SECONDS = int(os.getenv("JARVIS_VOICE_BRIDGE_TIMEOUT_SECONDS", "180"))
+SLOW_VOICE_LOG_SECONDS = float(os.getenv("JARVIS_SLOW_VOICE_LOG_SECONDS", "30"))
+OPS_CHANNEL_ID = os.getenv("JARVIS_OPS_CHANNEL_ID", "1491914989668143194")
 BRIDGE_SENDER = os.getenv("JARVIS_BRIDGE_SENDER", "spencerhuck@34dev.com")
 BRIDGE_PYTHON = os.getenv("JARVIS_BRIDGE_PYTHON", "python3")
+BRIDGE_TIMEOUT_REPLY = (
+    "That request is taking longer than expected. The work may still be happening — "
+    "check your inbox/calendar in 2 minutes. Or send me a simpler request and I'll handle it now."
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -292,6 +299,7 @@ def _call_universal_bridge(
     openclaw_session_id: str,
     sender: str,
     calendar_id: Optional[str] = None,
+    timeout_seconds: int = BRIDGE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     if not BRIDGE_SCRIPT.is_file():
         raise RuntimeError(f"bridge script not found: {BRIDGE_SCRIPT}")
@@ -323,7 +331,7 @@ def _call_universal_bridge(
         cmd,
         capture_output=True,
         text=True,
-        timeout=BRIDGE_TIMEOUT_SECONDS,
+        timeout=timeout_seconds,
         check=False,
     )
     if result.returncode != 0:
@@ -354,12 +362,38 @@ def _audit_bridge_context(request: Request) -> tuple[str, Optional[str]]:
     return BRIDGE_SENDER, None
 
 
+def _send_ops_message(message: str) -> None:
+    if not OPS_CHANNEL_ID:
+        return
+    try:
+        subprocess.run(
+            [
+                "/opt/homebrew/bin/openclaw",
+                "message",
+                "send",
+                "--channel",
+                "discord",
+                "--target",
+                OPS_CHANNEL_ID,
+                "--message",
+                message,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        log.exception("[ops-log] failed to send ops message")
+
+
 async def _exchange_turn(
     chat_id: str,
     user_content: str,
     channel: str,
     sender: str = BRIDGE_SENDER,
     calendar_id: Optional[str] = None,
+    bridge_timeout_seconds: int = BRIDGE_TIMEOUT_SECONDS,
 ) -> tuple[str, str, str, str, list[dict[str, Any]]]:
     """
     Append one user → assistant turn to an existing chat.
@@ -412,6 +446,7 @@ async def _exchange_turn(
             openclaw_session_id=openclaw_session_id,
             sender=sender,
             calendar_id=calendar_id,
+            timeout_seconds=bridge_timeout_seconds,
         )
         reply_text = bridge_payload["response_text"]
         actions_taken = bridge_payload.get("actions_taken") or []
@@ -420,7 +455,7 @@ async def _exchange_turn(
             f"[bridge-error] bridge timed out for chat={chat_id} "
             f"channel={channel} session={openclaw_session_id}"
         )
-        reply_text = "Sorry, I had trouble with that. Could you try again?"
+        reply_text = BRIDGE_TIMEOUT_REPLY
         actions_taken = []
     except Exception:
         log.exception(
@@ -696,6 +731,7 @@ async def chat_voice_message(
     Frontend renders user + assistant bubbles (each with a 🎙️ + replay
     button) and auto-plays the assistant audio.
     """
+    started_at = time.monotonic()
     audio_bytes = await audio.read()
     log.info(f"[VOICE {chat_id}] received {len(audio_bytes)} bytes")
 
@@ -729,6 +765,7 @@ async def chat_voice_message(
         channel="pwa-voice",
         sender=sender,
         calendar_id=calendar_id,
+        bridge_timeout_seconds=VOICE_BRIDGE_TIMEOUT_SECONDS,
     )
     _set_message_audio(user_msg_id, user_audio_url)
 
@@ -766,6 +803,25 @@ async def chat_voice_message(
         log.exception(f"[VOICE {chat_id}] TTS first chunk timed out; assistant text only")
     except Exception:
         log.exception(f"[VOICE {chat_id}] TTS failed before first chunk; assistant text only")
+
+    elapsed = time.monotonic() - started_at
+    if elapsed > SLOW_VOICE_LOG_SECONDS:
+        preview = transcript.replace("\n", " ").strip()
+        if len(preview) > 700:
+            preview = preview[:700].rstrip() + "…"
+        log.warning(
+            f"[VOICE {chat_id}] slow request elapsed={elapsed:.1f}s "
+            f"chars={len(transcript)} actions={len(actions_taken)}"
+        )
+        asyncio.create_task(
+            asyncio.to_thread(
+                _send_ops_message,
+                (
+                    "Slow PWA voice request: "
+                    f"{elapsed:.1f}s, chat `{chat_id}`, transcript: {preview}"
+                ),
+            )
+        )
 
     return {
         "user_message": {

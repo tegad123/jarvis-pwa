@@ -361,6 +361,10 @@ button {
   opacity: 0.55;
   font-style: italic;
 }
+.chat-bubble-working {
+  border-color: rgba(201,242,92,0.24);
+  box-shadow: 0 0 18px rgba(201,242,92,0.06);
+}
 .chat-bubble-text {
   min-width: 0;
 }
