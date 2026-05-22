@@ -1,0 +1,34 @@
+{
+  "tests": [
+    {
+      "id": "TASK-CREATE-1",
+      "category": "tasks",
+      "message": "Create a task for me to call Brad Friday morning",
+      "expect": {
+        "db_check": "SELECT 1 FROM tasks WHERE task_summary LIKE ? AND created_at > datetime('now', '-5 minutes')",
+        "db_params": ["%{prefix}%Brad%"]
+      }
+    },
+    {
+      "id": "CALENDAR-SEND-1",
+      "category": "calendar",
+      "message": "Send a calendar invite to test-attendee@34dev.com for tomorrow 2pm about Slabs",
+      "expect": {
+        "google_calendar_check": {
+          "attendee": "test-attendee@34dev.com",
+          "summary_contains": "Slabs",
+          "within_hours": 48
+        }
+      }
+    },
+    {
+      "id": "BRIDGE-WIRING-1",
+      "category": "infrastructure",
+      "message": "What time is it",
+      "expect": {
+        "response_contains_one_of": ["AM", "PM", "now is"],
+        "log_check": "[bridge-invoke]"
+      }
+    }
+  ]
+}

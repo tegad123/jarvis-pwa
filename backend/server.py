@@ -311,6 +311,10 @@ def _call_universal_bridge(
         "--context-json",
         json.dumps(context),
     ]
+    log.info(
+        f"[bridge-invoke] chat={chat_id} channel={channel} "
+        f"session={openclaw_session_id}"
+    )
     result = subprocess.run(
         cmd,
         capture_output=True,
