@@ -71,7 +71,7 @@ Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "9IzcwKmvwJcw58h3KnlH")
-ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2")
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
@@ -306,6 +306,14 @@ async def _exchange_turn(
             (chat_id,),
         ).fetchall()
 
+        # Look up persisted session key for this chat so the gateway
+        # can maintain context across turns (session continuity).
+        session_row = conn.execute(
+            "SELECT openclaw_session_id FROM session_map WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        openclaw_session_id = session_row["openclaw_session_id"] if session_row else None
+
     history = [{"role": r["role"], "content": r["content"]} for r in history_rows]
 
     try:
@@ -313,6 +321,7 @@ async def _exchange_turn(
             history,
             anthropic_client=anthropic_client,
             system_prompt=system_prompt,
+            session_id=openclaw_session_id,
         )
     except Exception:
         log.exception(f"[CHAT {chat_id}] gateway call failed")

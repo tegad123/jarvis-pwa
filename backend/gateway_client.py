@@ -42,6 +42,7 @@ async def complete(
     messages: list[dict],
     anthropic_client: Optional[AsyncAnthropic] = None,
     system_prompt: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """
     Send a conversation to whichever backend is configured.
@@ -51,16 +52,15 @@ async def complete(
     (used by Talk mode for the short-form voice prompt).
     Returns the assistant's reply text.
 
-    Note: session_id passing to the relay gateway is intentionally
-    omitted in v1 — the gateway will spin up a fresh session per call.
-    The session_map table is populated for future use, but not wired
-    through to the relay request yet.
+    `session_id`, if provided, is passed as the x-openclaw-session-key
+    header in relay mode so the gateway preserves conversation context
+    across turns for the same chat.
     """
     mode = current_mode()
     if mode == "mock":
         return await _mock_complete(messages, anthropic_client, system_prompt)
     if mode == "relay":
-        return await _relay_complete(messages, system_prompt)
+        return await _relay_complete(messages, system_prompt, session_id=session_id)
     raise RuntimeError(f"Unknown JARVIS_GATEWAY_MODE: {mode!r}")
 
 
@@ -93,6 +93,7 @@ async def _mock_complete(
 async def _relay_complete(
     messages: list[dict],
     system_prompt: Optional[str],
+    session_id: Optional[str] = None,
 ) -> str:
     base_url = os.getenv("JARVIS_GATEWAY_URL", "http://127.0.0.1:18789").rstrip("/")
     token = os.getenv("JARVIS_GATEWAY_TOKEN", "")
@@ -110,8 +111,18 @@ async def _relay_complete(
     if system_prompt:
         final_messages = [{"role": "system", "content": system_prompt}, *final_messages]
 
-    client = AsyncOpenAI(base_url=f"{base_url}/v1", api_key=token)
-    log.info(f"[gateway:relay] {len(final_messages)} msgs -> {RELAY_MODEL} @ {base_url}")
+    # Pass session key via extra headers so OpenClaw persists context
+    # across turns for the same chat_id.
+    extra_headers: dict = {}
+    if session_id:
+        extra_headers["x-openclaw-session-key"] = session_id
+
+    client = AsyncOpenAI(
+        base_url=f"{base_url}/v1",
+        api_key=token,
+        default_headers=extra_headers if extra_headers else None,
+    )
+    log.info(f"[gateway:relay] {len(final_messages)} msgs -> {RELAY_MODEL} @ {base_url} session={session_id!r}")
     resp = await client.chat.completions.create(
         model=RELAY_MODEL,
         messages=final_messages,
