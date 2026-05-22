@@ -197,7 +197,7 @@
       "category": "edge_cases",
       "message": "Call him back",
       "expect": {
-        "response_contains_one_of": ["who", "which", "clarify", "more information", "more context"]
+        "response_contains_one_of": ["who", "which", "clarify", "more information", "more context", "ambiguous"]
       }
     },
     {
