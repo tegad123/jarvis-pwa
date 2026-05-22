@@ -22,10 +22,12 @@ Runs on Mac Mini, exposed via Cloudflare tunnel.
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
 import sqlite3
+import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -50,8 +52,6 @@ from chat_auth import (
     verify_password,
 )
 from elevenlabs_tts import synthesize_voice_stream
-import gateway_client
-from jarvis_brain import JARVIS_VOICE_SYSTEM, answer_with_voice_brain
 
 # ──────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -76,6 +76,15 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "9IzcwKmvwJcw58h3KnlH")
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+BRIDGE_SCRIPT = Path(
+    os.getenv(
+        "JARVIS_BRIDGE_SCRIPT",
+        str(Path.home() / ".openclaw" / "workspace" / "skills" / "universal-bridge" / "handle_request.py"),
+    )
+)
+BRIDGE_TIMEOUT_SECONDS = int(os.getenv("JARVIS_BRIDGE_TIMEOUT_SECONDS", "120"))
+BRIDGE_SENDER = os.getenv("JARVIS_BRIDGE_SENDER", "spencerhuck@34dev.com")
+BRIDGE_PYTHON = os.getenv("JARVIS_BRIDGE_PYTHON", "python3")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -258,17 +267,84 @@ def _make_title(text: str, limit: int = 40) -> str:
     return text[:limit].rstrip() + "…"
 
 
+def _get_or_create_openclaw_session_id(conn: sqlite3.Connection, chat_id: str) -> str:
+    session_row = conn.execute(
+        "SELECT openclaw_session_id FROM session_map WHERE chat_id = ?",
+        (chat_id,),
+    ).fetchone()
+    if session_row and session_row["openclaw_session_id"]:
+        return session_row["openclaw_session_id"]
+
+    openclaw_session_id = f"pwa:chat:{chat_id}"
+    conn.execute(
+        "INSERT OR REPLACE INTO session_map (chat_id, openclaw_session_id, created_at) "
+        "VALUES (?, ?, ?)",
+        (chat_id, openclaw_session_id, _now_iso()),
+    )
+    return openclaw_session_id
+
+
+def _call_universal_bridge(
+    *,
+    chat_id: str,
+    user_content: str,
+    channel: str,
+    openclaw_session_id: str,
+) -> str:
+    if not BRIDGE_SCRIPT.is_file():
+        raise RuntimeError(f"bridge script not found: {BRIDGE_SCRIPT}")
+
+    context = {
+        "session_id": openclaw_session_id,
+        "chat_id": chat_id,
+        "sender": BRIDGE_SENDER,
+    }
+    cmd = [
+        BRIDGE_PYTHON,
+        str(BRIDGE_SCRIPT),
+        "--message",
+        user_content,
+        "--channel",
+        channel,
+        "--session-id",
+        openclaw_session_id,
+        "--context-json",
+        json.dumps(context),
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=BRIDGE_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"bridge exited {result.returncode}; stderr={result.stderr[-1000:]!r}; "
+            f"stdout={result.stdout[-1000:]!r}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bridge returned malformed JSON: {result.stdout[-1000:]!r}") from exc
+
+    errors = payload.get("errors") or []
+    response_text = (payload.get("response_text") or "").strip()
+    if errors or not response_text:
+        raise RuntimeError(f"bridge errors={errors!r}; response_empty={not response_text}")
+    return response_text
+
+
 async def _exchange_turn(
     chat_id: str,
     user_content: str,
-    system_prompt: Optional[str] = None,
-    voice_fallback: bool = False,
+    channel: str,
 ) -> tuple[str, str, str, str]:
     """
     Append one user → assistant turn to an existing chat.
 
-    Steps: insert user msg, auto-title chat if title is null, load full
-    history, call gateway with optional system_prompt, insert assistant
+    Steps: insert user msg, auto-title chat if title is null, invoke the
+    universal bridge with this chat's OpenClaw session id, insert assistant
     msg, bump last_message_at.
 
     Returns (user_msg_id, assistant_msg_id, assistant_text,
@@ -276,10 +352,8 @@ async def _exchange_turn(
     + assistant_msg_id to UPDATE both rows with audio metadata after
     the gateway round-trip.
 
-    Raises 404 if chat_id does not exist. Raises 502 if the gateway
-    errors AND voice_fallback is False. If voice_fallback is True, on
-    gateway error we instead call answer_with_voice_brain() directly
-    via Anthropic so the voice path still produces a spoken reply.
+    Raises 404 if chat_id does not exist. Bridge failures are logged with
+    [bridge-error] and return a graceful user-facing response.
     """
     with db() as conn:
         chat_row = conn.execute(
@@ -306,35 +380,28 @@ async def _exchange_turn(
                 (user_now, chat_id),
             )
 
-        history_rows = conn.execute(
-            "SELECT role, content FROM messages WHERE chat_id = ? "
-            "ORDER BY created_at ASC, message_id ASC",
-            (chat_id,),
-        ).fetchall()
-
-        # Look up persisted session key for this chat so the gateway
-        # can maintain context across turns (session continuity).
-        session_row = conn.execute(
-            "SELECT openclaw_session_id FROM session_map WHERE chat_id = ?",
-            (chat_id,),
-        ).fetchone()
-        openclaw_session_id = session_row["openclaw_session_id"] if session_row else None
-
-    history = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+        openclaw_session_id = _get_or_create_openclaw_session_id(conn, chat_id)
 
     try:
-        reply_text = await gateway_client.complete(
-            history,
-            anthropic_client=anthropic_client,
-            system_prompt=system_prompt,
-            session_id=openclaw_session_id,
+        reply_text = await asyncio.to_thread(
+            _call_universal_bridge,
+            chat_id=chat_id,
+            user_content=user_content,
+            channel=channel,
+            openclaw_session_id=openclaw_session_id,
         )
+    except subprocess.TimeoutExpired:
+        log.exception(
+            f"[bridge-error] bridge timed out for chat={chat_id} "
+            f"channel={channel} session={openclaw_session_id}"
+        )
+        reply_text = "Sorry, I had trouble with that. Could you try again?"
     except Exception:
-        log.exception(f"[CHAT {chat_id}] gateway call failed")
-        if not voice_fallback:
-            raise HTTPException(502, "gateway error")
-        log.warning(f"[CHAT {chat_id}] gateway down; falling back to direct voice brain")
-        reply_text = await answer_with_voice_brain(anthropic_client, history)
+        log.exception(
+            f"[bridge-error] bridge failed for chat={chat_id} "
+            f"channel={channel} session={openclaw_session_id}"
+        )
+        reply_text = "Sorry, I had trouble with that. Could you try again?"
 
     assistant_msg_id = uuid.uuid4().hex
     assistant_now = _now_iso()
@@ -568,7 +635,7 @@ async def chat_send_message(chat_id: str, req: MessageRequest):
     _, assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
         chat_id=chat_id,
         user_content=content,
-        voice_fallback=False,
+        channel="pwa-chat",
     )
     return {
         "message_id": assistant_msg_id,
@@ -622,12 +689,11 @@ async def chat_voice_message(
     (AUDIO_CACHE_DIR / user_audio_name).write_bytes(audio_bytes)
     user_audio_url = f"/chat/api/audio/{user_audio_name}"
 
-    # Persist user → gateway → assistant.
+    # Persist user → universal bridge → assistant.
     user_msg_id, assistant_msg_id, reply_text, assistant_now = await _exchange_turn(
         chat_id=chat_id,
         user_content=transcript,
-        system_prompt=JARVIS_VOICE_SYSTEM,
-        voice_fallback=True,
+        channel="pwa-voice",
     )
     _set_message_audio(user_msg_id, user_audio_url)
 
