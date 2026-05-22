@@ -41,7 +41,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from openai import AsyncOpenAI
+from openai import APITimeoutError, AsyncOpenAI
 from pydantic import BaseModel
 
 from chat_auth import (
@@ -84,6 +84,7 @@ BRIDGE_SCRIPT = Path(
 )
 BRIDGE_TIMEOUT_SECONDS = int(os.getenv("JARVIS_BRIDGE_TIMEOUT_SECONDS", "120"))
 VOICE_BRIDGE_TIMEOUT_SECONDS = int(os.getenv("JARVIS_VOICE_BRIDGE_TIMEOUT_SECONDS", "180"))
+WHISPER_TIMEOUT_SECONDS = float(os.getenv("JARVIS_WHISPER_TIMEOUT_SECONDS", "180"))
 SLOW_VOICE_LOG_SECONDS = float(os.getenv("JARVIS_SLOW_VOICE_LOG_SECONDS", "30"))
 OPS_CHANNEL_ID = os.getenv("JARVIS_OPS_CHANNEL_ID", "1491914989668143194")
 BRIDGE_SENDER = os.getenv("JARVIS_BRIDGE_SENDER", "spencerhuck@34dev.com")
@@ -255,11 +256,17 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> 
         raise HTTPException(500, "OpenAI client not configured")
     file_obj = io.BytesIO(audio_bytes)
     file_obj.name = filename
-    transcript = await openai_client.audio.transcriptions.create(
-        model="whisper-1",
-        file=file_obj,
-        response_format="text",
-    )
+    try:
+        transcript = await openai_client.with_options(
+            timeout=WHISPER_TIMEOUT_SECONDS
+        ).audio.transcriptions.create(
+            model="whisper-1",
+            file=file_obj,
+            response_format="text",
+        )
+    except APITimeoutError as exc:
+        log.exception("[VOICE] Whisper transcription timed out")
+        raise HTTPException(504, BRIDGE_TIMEOUT_REPLY) from exc
     return str(transcript).strip()
 
 
