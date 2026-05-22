@@ -27,7 +27,7 @@ from anthropic import AsyncAnthropic
 
 log = logging.getLogger("jarvis-pwa.brain")
 
-JARVIS_VOICE_MODEL = "claude-sonnet-4-6"
+JARVIS_VOICE_MODEL = "claude-haiku-4-5"
 JARVIS_VOICE_MAX_TOKENS = 200
 
 JARVIS_VOICE_SYSTEM = (

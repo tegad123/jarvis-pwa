@@ -12,7 +12,7 @@ async def synthesize_voice(
     text: str,
     api_key: str,
     voice_id: str = "9IzcwKmvwJcw58h3KnlH",
-    model: str = "eleven_multilingual_v2",
+    model: str = "eleven_turbo_v2_5",
 ) -> bytes:
     """Convert text to mp3 audio bytes via ElevenLabs."""
     if not api_key:
