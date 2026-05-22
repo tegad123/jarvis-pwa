@@ -186,6 +186,8 @@
       "id": "VOICE-EMPTY",
       "category": "voice",
       "message": "",
+      "skip_in_text_harness": true,
+      "skip_reason": "Empty audio is only applicable to the voice upload endpoint, not the text harness.",
       "expect": {
         "response_contains_one_of": ["didn't catch", "empty", "try again", "couldn't hear", "no input"]
       }

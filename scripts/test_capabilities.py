@@ -621,6 +621,19 @@ def run(cfg: HarnessConfig) -> dict[str, Any]:
             test_id = test.get("id", f"test-{idx}")
             category = test.get("category", "unknown")
             prompt = build_prompt(test.get("message", ""), prefix)
+            if test.get("skip_in_text_harness"):
+                reason = test.get("skip_reason", "not applicable to text harness")
+                print(f"SKIP {test_id}: {reason}", flush=True)
+                results.append(
+                    TestResult(
+                        id=test_id,
+                        category=category,
+                        status="skipped",
+                        message=prompt,
+                        errors=[reason],
+                    )
+                )
+                continue
             if test.get("_skip_reason"):
                 print(f"SKIP {test_id}: {test['_skip_reason']}", flush=True)
                 results.append(
